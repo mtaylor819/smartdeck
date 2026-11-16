@@ -75,8 +75,8 @@ export const defaultConfig = (): Config => ({
     {
       name: 'Main',
       buttons: [
-        { label: 'Safari', action: { type: 'app', app: 'Safari' } },
-        { label: 'Terminal', action: { type: 'app', app: 'Terminal' } },
+        { label: 'Chrome', action: { type: 'app', app: 'Google Chrome' } },
+        { label: 'iTerm2', action: { type: 'app', app: 'iTerm' } },
         { label: 'VS Code', action: { type: 'app', app: 'Visual Studio Code' } },
         { label: 'Mute', action: { type: 'media', key: 'mute' } },
         { label: 'Play/Pause', action: { type: 'media', key: 'play_pause' } },

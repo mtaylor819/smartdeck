@@ -162,7 +162,7 @@ test('config getter is read live (UI edits apply without restart)', async () => 
   t.deck('BTN:0:0'); await tick();
   cfg = { ...cfg, pages: [{ name: 'x', buttons: [{ action: { type: 'app', app: 'Notes' } }] }] };
   t.deck('BTN:0:0'); await tick();
-  assert.deepEqual(calls.map((c) => c[2]), ['Safari', 'Notes']);
+  assert.deepEqual(calls.map((c) => c[2]), ['Google Chrome', 'Notes']);
 });
 
 test('LaunchAgent plist escapes paths and runs at load', () => {

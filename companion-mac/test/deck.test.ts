@@ -22,9 +22,9 @@ test('start() sends time, brightness, knob LED, then GET_SYNC', async () => {
 
 test('BTN event runs the configured action for that page/index', async () => {
   const { t, calls } = setup();
-  t.deck('BTN:0:0'); // Safari
+  t.deck('BTN:0:0'); // Chrome
   await tick();
-  assert.deepEqual(calls, [['open', '-a', 'Safari']]);
+  assert.deepEqual(calls, [['open', '-a', 'Google Chrome']]);
   t.deck('BTN:0:10'); // GitHub
   await tick();
   assert.deepEqual(calls[1], ['open', 'https://github.com']);
@@ -92,7 +92,7 @@ test('device config JSON strips host-only fields and keeps firmware fields', () 
   const cfg = defaultConfig();
   const dev = toDeviceConfig(cfg) as any;
   assert.equal(dev.grid.cols, 4);
-  assert.deepEqual(dev.pages[0].buttons[0], { label: 'Safari', type: 'app' });
+  assert.deepEqual(dev.pages[0].buttons[0], { label: 'Chrome', type: 'app' });
   assert.deepEqual(dev.pages[0].buttons[7], { label: 'Screenshot', type: 'key', combo: 'cmd+shift+4' });
   assert.deepEqual(dev.pages[0].buttons[11], { label: 'Page 2', type: 'goto', page: 2 });
   assert.equal(JSON.stringify(dev).includes('github.com'), false); // URLs stay on the Mac

@@ -586,3 +586,16 @@ async function init() {
   setInterval(pollStatus, 2000);
 }
 init();
+
+// LCARS flavour: a decorative "stardate" in the footer (year.day-of-year fraction).
+(function () {
+  const el = document.getElementById('stardate');
+  if (!el) return;
+  const tick = () => {
+    const n = new Date();
+    const day = Math.floor((n - new Date(n.getFullYear(), 0, 0)) / 864e5);
+    el.textContent = 'STARDATE ' + n.getFullYear() + '.' + String(day).padStart(3, '0') + ' · ' + n.toTimeString().slice(0, 5);
+  };
+  tick();
+  setInterval(tick, 30000);
+})();
