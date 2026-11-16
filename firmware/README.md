@@ -129,3 +129,14 @@ Example: `SET_NET:{"ssid":"MyWifi","pass":"secret-pass","host":"smartdeck","toke
 - **Standalone** `ha` / `http` buttons run on a short-lived task with 3 s timeouts when no host is connected (or always, with
   `"standalone":"always"`). `https://` skips certificate verification (`setInsecure`): the deck has no CA bundle.
 - **NTP**: once WiFi is up the deck sets its own clock (TZ from `tz`) unless a host has sent `SET_TIME` in the last 10 minutes.
+
+## Release artifacts (all modules merged)
+
+| File | Use |
+|---|---|
+| `dist/smartdeck-jc8048w550-merged.bin` | First flash over USB at offset `0x0` (`smartdeck-mac flash`). Also for recovery after a bad OTA. |
+| `dist/smartdeck-jc8048w550-app.bin` | **OTA only**: `smartdeck-mac ota firmware/dist/smartdeck-jc8048w550-app.bin`. The Mac app refuses the merged image here. |
+
+Size: app 1.35 MB of the 3 MB slot (42%), static RAM 19%. Included modules: diagnostics + animated sleep screens, LED alerts,
+BH1750 auto-dim, swipe/hold gestures, WiFi + authenticated TCP host link + OTA + NTP + standalone HA/HTTP, BLE HID keyboard.
+**None of it has run on a real board.** First boot is the first test; keep the USB cable handy for a reflash.

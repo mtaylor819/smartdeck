@@ -35,6 +35,7 @@ bool features_command(const String& c) {
 
 // Run a button on the deck itself (called when no host is connected). Returns true if something executed.
 bool standalone_button(int page, int idx, bool hasState, bool state) {
+  if (net_standalone_mode() == 2) return false;   // standalone: "never" disables ALL on-deck execution (BLE and WiFi)
   JsonObject cfg = doc["pages"][page]["buttons"][idx];
   if (cfg.isNull()) return false;
   return ble_button(cfg, page, idx, hasState, state) || net_button(cfg, page, idx, hasState, state);

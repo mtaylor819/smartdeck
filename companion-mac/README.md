@@ -20,6 +20,8 @@ parameters such as app names, URLs and scripts never go to the device.
 | Mac-side press/error sounds (`sounds` in config; synthesized WAVs in `sounds/`) | Done, tested (afplay on a real Mac untested) |
 | Starship-diagnostics sleep screen (`sleepScreen: "diag"`) | Mac sender done + tested; firmware side compile-checked only, **never seen on a real screen** |
 | `flash` (esptool), `install-service` (launch at login) | Done; flashing unverified on hardware |
+| WiFi link, provisioning, OTA, heartbeat, hold + alert actions, brightness schedule | Done; tested against a fake WiFi deck |
+| Firmware: WiFi/OTA, BLE HID, LED alerts, auto-dim, gestures, animations | Compiles (app 1.35 MB / 3 MB); **never run on hardware** |
 | **Real macOS / real deck** | **Not yet verified** (built on Linux, no hardware) |
 
 See `ROADMAP.md` for what's next.
@@ -52,6 +54,24 @@ packaged app) so `System Events` keystrokes and media keys work.
   Built-ins: `chirp`, `confirm`, `error`, `blip` (regenerate with `node scripts/make-sounds.mjs`), or any absolute file path.
 - **Diagnostics sleep screen:** set `"sleepScreen": "diag"` (Settings → Sleep screen). Needs the updated firmware in `../firmware/`.
   The Mac sends CPU, memory, disk, network and uptime every 5 s.
+
+## WiFi, Bluetooth and standalone use (needs the updated firmware)
+
+Flash `firmware/dist/smartdeck-jc8048w550-merged.bin` once over USB, then:
+
+1. **Provision over USB** (Settings -> *Deck connectivity*): WiFi SSID + password, a link/OTA token (*Generate*), optional
+   Bluetooth and Home Assistant details for the deck itself, then *Push to deck*. Secrets travel **only over USB**.
+2. **WiFi link:** set *Deck address* (`smartdeck.local`). The Mac app uses USB when plugged in and falls back to WiFi otherwise
+   (plain TCP on your LAN, protected by the token).
+3. **Standalone:** with no Mac connected the deck runs buttons itself: `key`/`text`/`media` over a **Bluetooth keyboard** to any
+   machine, `ha`/`http` over WiFi straight to Home Assistant. *Run on the deck* = auto / always / never.
+4. **OTA updates:** `smartdeck-mac ota ../firmware/dist/smartdeck-jc8048w550-app.bin` (app image only). No automatic rollback on this
+   ESP32 core: a bad image that boot-loops needs a USB reflash with the merged image.
+5. **Red alert:** `smartdeck-mac alert red 30 "Build failed"` (also a button action, `POST /api/alert`, or the test buttons in Settings).
+   Touching the deck acknowledges it. Kinds: red, yellow, blue, green, off.
+6. **Gestures:** swipe left/right to change page; buttons with a *long-press action* send `BTN_HOLD`.
+7. **Auto-dim:** needs a BH1750 light sensor (I2C). Without one, use the **brightness schedule** (works from the Mac).
+8. **Sleep screens:** clock, diagnostics, animated diagnostics, warp-speed starfield.
 
 ## Config example
 
