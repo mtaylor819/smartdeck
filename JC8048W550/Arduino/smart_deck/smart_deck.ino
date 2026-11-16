@@ -234,9 +234,19 @@ void draw_single_button(int btn_index);
 void checkActiveTimers();
 
 
+bool host_link_active();                                              // features.h
+bool standalone_button(int page, int idx, bool hasState, bool state);  // features.h
+
 // *** NEW: Send Command to PC/Dongle Function (State Supported) ***
 void send_pc_command(int page, int index) {
   char command[64];
+
+  // No host app connected? Try to run the button on the deck itself (BLE keyboard / WiFi Home Assistant).
+  if (!host_link_active()) {
+    bool st = (index >= 0 && index < (int)current_toggles.size()) ? current_toggles[index].state : false;
+    bool isToggle = current_buttons[index].action == "toggle";
+    if (standalone_button(page, index, isToggle, st)) return;
+  }
 
   // Check if button is Toggle
   if (current_buttons[index].action == "toggle") {
@@ -1932,6 +1942,8 @@ void draw_page(int page_index) {
 
 
 // --- SETUP FUNCTION ---
+#include "features.h"
+
 void setup() {
   Serial.begin(115200);
   Serial.setTimeout(10);
@@ -2093,6 +2105,7 @@ void setup() {
     Serial.println("Initial page drawn. Setup done.");
   }
 
+  features_setup();
   Serial.println("SETUP_DONE");
   update_activity();
 }
@@ -2107,6 +2120,7 @@ unsigned long last_valid_touch_time = 0;  // Debounce for touch
 
 void loop() {
   unsigned long currentMillis = millis();
+  features_loop();
 
   // ============================================================
   // 0. INTERNAL CLOCK UPDATE (millis-based)
@@ -2262,6 +2276,7 @@ void loop() {
   if (Serial.available() > 0) {
     String command = Serial.readStringUntil('\n');
     command.trim();
+    if (features_command(command)) command = "";  // feature modules get first look (features.h)
 
     if (command.length() > 0) {
 

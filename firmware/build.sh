@@ -10,7 +10,8 @@ SKETCH="$ROOT/JC8048W550/Arduino/smart_deck"
 LIBS="$ROOT/JC8048W550/Arduino/libraries"     # vendored, do not install others
 CLI="${ARDUINO_CLI:-arduino-cli}"
 WORK="${SMARTDECK_FW_WORK:-$HERE/.work}"      # toolchains, build cache, venv (gitignored)
-DIST="$HERE/dist"
+DIST="${SMARTDECK_FW_DIST:-$HERE/dist}"          # override to build in parallel without clobbering dist/
+BUILD="${SMARTDECK_FW_BUILD:-$WORK/build}"        # override per parallel build
 
 CORE_VERSION="2.0.17"                         # README: "ESP32 Board Package v2.0.17"
 ESPTOOL_VERSION="4.8.1"
@@ -35,9 +36,12 @@ export PATH="$WORK/venv/bin:$PATH"
 "$CLI" core update-index --additional-urls "$CORE_URL"
 "$CLI" core install "esp32:esp32@$CORE_VERSION" --additional-urls "$CORE_URL"
 
-"$CLI" compile --fqbn "$FQBN" --board-options "$OPTIONS" \
+# Several builds can share one toolchain dir; serialise the compile step if flock exists.
+LOCK=()
+command -v flock >/dev/null 2>&1 && LOCK=(flock "$WORK/.compile.lock")
+"${LOCK[@]}" "$CLI" compile --fqbn "$FQBN" --board-options "$OPTIONS" \
   --libraries "$LIBS" \
-  --build-path "$WORK/build" --output-dir "$DIST/parts" "$SKETCH"
+  --build-path "$BUILD" --output-dir "$DIST/parts" "$SKETCH"
 
 P="$DIST/parts"
 BOOT_APP0="$(find "$ARDUINO_DIRECTORIES_DATA/packages/esp32/hardware/esp32/$CORE_VERSION/tools/partitions" -name boot_app0.bin | head -1)"
