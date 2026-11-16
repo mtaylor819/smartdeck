@@ -94,6 +94,23 @@ async function main() {
       await otaUpdate(d.address, d.token, bin, fetch, (m) => console.log(m));
       return;
     }
+    case 'virtual': {
+      // Software deck for testing without hardware. Point the Mac app at it with device.address "127.0.0.1" + the same token.
+      const { startVirtualDeck } = await import('./virtual/index.js');
+      const port = flag('--port'), uiPort = flag('--ui-port');
+      const token = flag('--token') ?? 'virtual-deck';
+      const d = await startVirtualDeck({
+        port: port !== undefined ? Number(port) : 7778, uiPort: uiPort !== undefined ? Number(uiPort) : 7780,
+        token, dataDir: flag('--data-dir'), log: (m) => console.log(`[deck] ${m}`),
+      });
+      console.log(`Virtual deck ready\n  host link : 127.0.0.1:${d.tcpPort}  (token: ${token})\n  screen    : ${d.uiUrl}\n` +
+        'To connect the app: set device.address "127.0.0.1" and device.token to the token above (and unplug any real deck).');
+      const quit = async () => { await d.close(); process.exit(0); };
+      process.on('SIGINT', quit);
+      process.on('SIGTERM', quit);
+      await new Promise(() => {});
+      return;
+    }
     case 'open': {
       const port = loadConfig().ui?.port ?? 7777;
       execFile('open', [`http://127.0.0.1:${port}/`]);
@@ -105,7 +122,7 @@ async function main() {
       return;
     }
     default:
-      console.log('usage: smartdeck-mac [run|open|init|ports|sync|flash|ota|alert|provision|install-service] [--port /dev/cu.usbmodemXXXX]');
+      console.log('usage: smartdeck-mac [run|open|init|ports|sync|flash|ota|alert|provision|virtual|install-service] [--port /dev/cu.usbmodemXXXX]');
       process.exitCode = 1;
   }
 }

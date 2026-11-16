@@ -17,7 +17,7 @@ import { weatherLine } from './weather.js';
 const WEATHER_EVERY_MS = 15 * 60_000;
 const DIAG_EVERY_MS = 5_000;
 const SCHEDULE_EVERY_MS = 30_000;
-const WIFI_RETRY_MS = 8_000;
+const WIFI_RETRY_MS = 3_000;
 
 export interface DaemonOptions {
   configFile?: string;
@@ -314,6 +314,7 @@ export class Daemon implements DaemonApi {
         this.log(`start failed: ${e instanceof Error ? e.message : e}`);
       }
       await closed;
+      this.lastWifiTry = 0; // a dropped link (e.g. deck reboot after upload) should reconnect right away
       this.widgets.stop();
       this.deck = undefined;
       this.log('disconnected; reconnecting...');

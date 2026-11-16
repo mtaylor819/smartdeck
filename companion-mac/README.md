@@ -73,6 +73,15 @@ Flash `firmware/dist/smartdeck-jc8048w550-merged.bin` once over USB, then:
 7. **Auto-dim:** needs a BH1750 light sensor (I2C). Without one, use the **brightness schedule** (works from the Mac).
 8. **Sleep screens:** clock, diagnostics, animated diagnostics, warp-speed starfield.
 
+## Virtual deck (test with no hardware)
+
+```sh
+npx tsx src/cli.ts virtual          # emulated deck: screen at http://127.0.0.1:7780, host link on 127.0.0.1:7778 (token: virtual-deck)
+```
+Set `device.address` to `127.0.0.1` and `device.token` to `virtual-deck` (and leave no real deck plugged in), then `npm start`.
+Click buttons, swipe, turn the knob, trigger alerts, force sleep screens. It speaks the same protocol as the firmware (see
+`PROTOCOL.md`) but its visuals for sleep screens, LED effects and the alert banner are approximations, and WiFi/BLE/OTA are state only.
+
 ## Config example
 
 ```json
