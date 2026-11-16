@@ -32,7 +32,7 @@ export function jsonPath(obj: unknown, path: string): unknown {
 
 /** Turn a raw value into the label + (optional) colour pushed to the deck. */
 export function renderWidget(w: Widget, value: string): { label: string; btnColor?: string } {
-  const label = (w.format ? w.format.replaceAll('{value}', value) : value).slice(0, MAX_LABEL);
+  const label = (w.format ? w.format.replaceAll('{value}', () => value) : value).slice(0, MAX_LABEL);
   const n = Number(value);
   let btnColor: string | undefined;
   if (w.thresholds && Number.isFinite(n)) {

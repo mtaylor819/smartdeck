@@ -15,7 +15,7 @@ export class SerialTransport extends EventEmitter implements Transport {
     const parser = port.pipe(new ReadlineParser({ delimiter: '\n' }));
     parser.on('data', (line: string) => this.emit('line', line.replace(/\r$/, '')));
     port.on('close', () => this.emit('close'));
-    port.on('error', (e) => this.emit('error', e));
+    port.on('error', (e) => { if (this.listenerCount('error')) this.emit('error', e); }); // an early error must not crash the process
   }
 
   static open(path: string): Promise<SerialTransport> {
@@ -102,7 +102,7 @@ export class TcpTransport extends EventEmitter implements Transport {
       }
     });
     sock.on('close', () => this.emit('close'));
-    sock.on('error', (e) => this.emit('error', e));
+    sock.on('error', (e) => { if (this.listenerCount('error')) this.emit('error', e); });
   }
 
   /** Connect and authenticate. Rejects on timeout, refusal or AUTH_FAIL. */

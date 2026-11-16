@@ -167,7 +167,8 @@ export async function startServer(api: DaemonApi, opts: ServerOptions = {}): Pro
       if (method === 'GET' && STATIC[path]) return send(res, 200, readFileSync(join(dir, path.slice(1))), STATIC[path]);
 
       if (method === 'GET' && path.startsWith('/icons/')) {
-        const name = decodeURIComponent(path.slice('/icons/'.length));
+        let name: string;
+        try { name = decodeURIComponent(path.slice('/icons/'.length)); } catch { return json(res, 400, { error: 'invalid icon name' }); }
         if (!ICON_FILE_RE.test(name)) return json(res, 400, { error: 'invalid icon name' });
         const f = join(api.iconsDir(), name);
         if (!existsSync(f)) return json(res, 404, { error: 'not found' });
@@ -175,7 +176,7 @@ export async function startServer(api: DaemonApi, opts: ServerOptions = {}): Pro
       }
 
       if (path.startsWith('/api/')) {
-        const needsToken = method !== 'GET' || path === '/api/config';
+        const needsToken = method !== 'GET' || path === '/api/config' || path === '/api/status' || path === '/api/icons';
         if (needsToken && !tokenOk(req)) return json(res, 403, { error: 'bad token' });
 
         if (method === 'GET' && path === '/api/config') return json(res, 200, maskConfig(api.getConfig()));
@@ -248,7 +249,8 @@ export async function startServer(api: DaemonApi, opts: ServerOptions = {}): Pro
           return json(res, 200, { name: file });
         }
         if (method === 'DELETE' && path.startsWith('/api/icons/')) {
-          const name = decodeURIComponent(path.slice('/api/icons/'.length));
+          let name: string;
+          try { name = decodeURIComponent(path.slice('/api/icons/'.length)); } catch { return json(res, 400, { error: 'invalid icon name' }); }
           if (!ICON_FILE_RE.test(name)) return json(res, 400, { error: 'invalid icon name' });
           const ok = deleteIcon(api.iconsDir(), name);
           if (ok) api.iconsChanged();

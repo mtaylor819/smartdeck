@@ -97,7 +97,14 @@ async function main() {
       for (const p of await listCandidatePorts()) console.log(p);
       return;
     case 'sync': {
-      // One-shot upload without the UI: stop the background service first (it owns the serial port).
+      // Prefer the running service (it owns the serial port / WiFi link); otherwise do a one-shot upload ourselves.
+      try {
+        await daemonPost('/api/sync', {});
+        console.log('Synced via the running SmartDeck service; the deck is rebooting.');
+        return;
+      } catch (e) {
+        if (!/Can't reach the SmartDeck daemon/.test(e instanceof Error ? e.message : '')) throw e;
+      }
       const d = new Daemon({ port: flag('--port') });
       void d.run();
       for (let i = 0; i < 20 && !d.status().connected; i++) await new Promise((r) => setTimeout(r, 1000));
@@ -124,8 +131,15 @@ async function main() {
       // smartdeck-mac flash <firmware.bin> [--port P]   (stop the background service first)
       const bin = rest.find((a) => !a.startsWith('--') && a !== flag('--port'));
       if (!bin) throw new Error('usage: smartdeck-mac flash <merged-firmware.bin> [--port /dev/cu.usbmodemXXXX]');
-      const port = flag('--port') ?? (await listCandidatePorts())[0];
-      if (!port) throw new Error('No serial port found. Hold BOOT while plugging in the deck, then retry.');
+      let port = flag('--port');
+      if (!port) {
+        const ports = await listCandidatePorts();
+        if (ports.length === 0) throw new Error('No serial port found. Hold BOOT while plugging in the deck, then retry.');
+        // Flashing overwrites the whole chip: never guess when more than one ESP32 is attached.
+        if (ports.length > 1) throw new Error(`Several serial ports found (${ports.join(', ')}). Pick the deck with --port.`);
+        port = ports[0];
+      }
+      console.log(`Flashing ${port}`);
       console.log(`Checksum: ${verifyChecksum(bin)}`);
       await runEsptool(flashArgs(port, bin));
       return;
@@ -152,6 +166,9 @@ async function main() {
         await kc.remove(name);
         console.log(`Removed "${name}".`);
       } else if (sub === 'migrate') {
+        // The running service holds the plain-text config in memory and would write it back on the next UI save.
+        const running = await daemonToken().then(() => true, () => false);
+        if (running) throw new Error('Stop the SmartDeck service first (launchctl bootout gui/$(id -u)/com.smartdeck.mac, or quit `npm start`), run migrate, then start it again.');
         const file = configPath();
         const raw = JSON.parse(readFileSync(file, 'utf8'));
         const { config, moved } = await migrateSecrets(raw, kc);

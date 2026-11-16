@@ -41,8 +41,9 @@ test('set sends the command via stdin, hex-encoded: no secret in any argv', asyn
   const { kc, calls, store } = fake();
   const secret = 'p@ss "w\\ord" \'x\' $HOME ünï ✓';
   await kc.set('ha-token', secret);
-  assert.equal(calls.length, 1);
+  assert.equal(calls.length, 2); // the write, then a read-back to verify it (security -i can exit 0 on failure)
   assert.deepEqual(calls[0].args, ['-i']);
+  assert.equal(calls[1].args[0], 'find-generic-password');
   assert.ok(calls[0].input!.endsWith('\n'));
   assert.ok(!calls[0].input!.includes('p@ss'), 'plaintext must not be in the command text either');
   assert.equal(store.get('ha-token'), secret);
@@ -131,4 +132,12 @@ test('SECRET_PATHS matches the server set', () => {
     SECRET_PATHS.map((p) => p.join('.')).sort(),
     ['device.ha.token', 'device.token', 'device.wifi.password', 'integrations.homeassistant.token'],
   );
+});
+
+test('set fails loudly when the read-back does not match (security -i can fail silently)', async () => {
+  const kc = new Keychain(async (_f, a) => {
+    if (a[0] === 'find-generic-password') { const e: any = new Error('nf'); e.code = 44; throw e; }
+    return ''; // "success" but nothing was stored
+  });
+  await assert.rejects(kc.set('x', 'secret-value'), /could not be verified/);
 });

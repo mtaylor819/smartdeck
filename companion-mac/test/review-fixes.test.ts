@@ -82,3 +82,69 @@ test('server returns a clear 400 for a config with no brightness', async () => {
     assert.match(((await r.json()) as any).error, /brightness/);
   } finally { await s.srv.close(); }
 });
+
+import { Deck } from '../src/deck.js';
+import { ActionExecutor } from '../src/actions.js';
+import { FakeTransport, tick } from './helpers.js';
+import { parseLine, sanitizeNetStatus } from '../src/protocol.js';
+import { toDeviceButton } from '../src/config.js';
+import { renderWidget } from '../src/widgets.js';
+import { TcpTransport } from '../src/transport.js';
+
+const mkDeck = (t: FakeTransport) => new Deck(t, defaultConfig(), new ActionExecutor(async () => {}), () => {});
+
+test('Deck.send refuses lines with newlines, and anything while an upload is running', async () => {
+  const t = new FakeTransport((d, self) => {
+    const l = String(d).trim();
+    if (l === 'START_UPLOAD') self.deck('READY');
+    if (l.startsWith('FILE:')) self.deck('OK_FILE');
+    if (l === 'END_UPLOAD') self.deck('DONE_REBOOT');
+    if (!l.startsWith('FILE:') && !['START_UPLOAD', 'END_UPLOAD'].includes(l) && typeof d !== 'string') self.deck('OK_DATA');
+  });
+  const d = mkDeck(t);
+  await assert.rejects(d.send('SET_PAGE:1\nSET_NET:{"x":1}'), /newline/);
+  const up = d.upload([{ name: 'a.jpg', data: Buffer.from('xyz') }]);
+  await assert.rejects(d.send('HB'), /upload in progress/);   // would otherwise land inside the file
+  await assert.rejects(d.upload([]), /already in progress/);  // no interleaved uploads
+  await up;
+  await d.send('HB'); // fine again afterwards
+  assert.ok(!t.lines().some((l) => l === 'HB' && t.lines().indexOf(l) < t.lines().indexOf('END_UPLOAD')));
+});
+
+test('a link that drops mid-upload rejects cleanly: no unhandled rejection from orphaned waiters', async () => {
+  const unhandled: unknown[] = [];
+  const h = (e: unknown) => unhandled.push(e);
+  process.on('unhandledRejection', h);
+  try {
+    const t = new FakeTransport((d, self) => { if (String(d).trim() === 'START_UPLOAD') self.deck('READY'); if (String(d).startsWith('FILE:')) setTimeout(() => self.emit('close'), 5); });
+    const d = mkDeck(t);
+    await assert.rejects(d.upload([{ name: 'a.jpg', data: Buffer.from('x') }]), /link closed|timed out/);
+    await tick(80);
+    assert.deepEqual(unhandled, []);
+  } finally { process.off('unhandledRejection', h); }
+});
+
+test('NET_STATUS from the network is sanitised (wrong types cannot crash the daemon)', () => {
+  const ev: any = parseLine('NET_STATUS:{"caps":5,"ble_slots":"x","wifi":"hax","rssi":"loud","fw":"v\\u0007' + 'x'.repeat(100) + '","ble":"connected"}');
+  assert.equal(ev.type, 'netStatus');
+  assert.deepEqual(Object.keys(ev.status).sort(), ['ble', 'fw']);
+  assert.equal(ev.status.fw.length, 40);
+  assert.ok(!/[\x00-\x1f]/.test(ev.status.fw));
+  assert.deepEqual(sanitizeNetStatus({ caps: ['btn_live', 3, 'ha_state'] }).caps, ['btn_live', 'ha_state']);
+  assert.deepEqual(sanitizeNetStatus(null), {});
+});
+
+test('http headers (Authorization) are not copied into the device JSON', () => {
+  const j: any = toDeviceButton({ action: { type: 'http', url: 'http://x', method: 'POST', body: 'b', headers: { Authorization: 'Bearer s3cret' } } });
+  assert.deepEqual(j.http, { url: 'http://x', method: 'POST', body: 'b' });
+  assert.ok(!JSON.stringify(j).includes('s3cret'));
+});
+
+test('widget format treats $& and $1 in values literally', () => {
+  assert.equal(renderWidget({ source: 'cpu', format: 'v={value}' }, '$&$1').label, 'v=$&$1');
+});
+
+test('an early socket error with no listener does not crash the process', async () => {
+  // connect to a closed port: rejects (handled) and must not throw an uncaught 'error' event
+  await assert.rejects(TcpTransport.connect('127.0.0.1:1', 'tok-12345678', 800));
+});

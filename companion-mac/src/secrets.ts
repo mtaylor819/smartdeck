@@ -74,6 +74,10 @@ export class Keychain {
     } catch {
       throw new Error(`keychain write failed for "${name}"`);
     }
+    // `security -i` can exit 0 even when a command inside it failed: read it back before claiming success.
+    let back: string | undefined;
+    try { back = await this.get(name); } catch { /* reported below */ }
+    if (back !== value) throw new Error(`keychain write for "${name}" could not be verified`);
   }
 
   async remove(name: string): Promise<void> {

@@ -84,14 +84,16 @@ test('rejects cross-origin requests', async () => {
   assert.equal(ok.status, 200);
 });
 
-test('token required on non-GET and on GET /api/config, not on GET /api/status', async () => {
+test('token required on non-GET and on GET /api/config, /api/status and /api/icons', async () => {
   assert.equal((await req('GET', '/api/config', { token: false })).status, 403);
   assert.equal((await req('GET', '/api/config', { headers: { 'x-smartdeck-token': 'x'.repeat(48) }, token: false })).status, 403);
   assert.equal((await req('POST', '/api/test', { token: false, body: '{"action":{"type":"none"}}' })).status, 403);
   assert.equal((await req('PUT', '/api/config', { token: false, body: '{}' })).status, 403);
   assert.equal((await req('POST', '/api/sync', { token: false })).status, 403);
   assert.equal((await req('DELETE', '/api/icons/a.jpg', { token: false })).status, 403);
-  assert.equal((await req('GET', '/api/status', { token: false })).status, 200);
+  assert.equal((await req('GET', '/api/status', { token: false })).status, 403);
+  assert.equal((await req('GET', '/api/icons', { token: false })).status, 403);
+  assert.equal((await req('GET', '/api/status')).status, 200);
 });
 
 test('config GET masks the HA token; PUT with mask keeps the secret', async () => {

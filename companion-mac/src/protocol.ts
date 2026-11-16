@@ -26,6 +26,26 @@ export interface NetStatus {
   caps?: string[]; ble_slot?: number; ble_slots?: string[];
 }
 
+const str = (v: unknown, max = 64) => (typeof v === 'string' ? v.replace(/[\x00-\x1f]/g, '').slice(0, max) : undefined);
+const num = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) ? v : undefined);
+const strs = (v: unknown, n: number, max: number) =>
+  Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string').slice(0, n).map((x) => str(x, max) ?? '') : undefined;
+
+/** NET_STATUS comes from the network/deck: trust nothing about its shape. */
+export function sanitizeNetStatus(o: unknown): NetStatus {
+  const r = (o && typeof o === 'object' ? o : {}) as Record<string, unknown>;
+  const pick = <T extends string>(v: unknown, allowed: readonly T[]): T | undefined => (allowed as readonly unknown[]).includes(v) ? (v as T) : undefined;
+  const out: NetStatus = {
+    wifi: pick(r.wifi, ['off', 'connecting', 'connected'] as const),
+    ip: str(r.ip, 45), rssi: num(r.rssi), host: str(r.host, 32), ssid: str(r.ssid, 32), clients: num(r.clients),
+    ota: typeof r.ota === 'boolean' ? r.ota : undefined, ntp: typeof r.ntp === 'boolean' ? r.ntp : undefined,
+    ble: pick(r.ble, ['off', 'advertising', 'connected'] as const), ble_peer: str(r.ble_peer, 48), fw: str(r.fw, 40),
+    caps: strs(r.caps, 16, 24), ble_slot: num(r.ble_slot), ble_slots: strs(r.ble_slots, 3, 12),
+  };
+  for (const k of Object.keys(out) as (keyof NetStatus)[]) if (out[k] === undefined) delete out[k];
+  return out;
+}
+
 const ints = (s: string): number[] => s.split(':').map((n) => parseInt(n, 10));
 
 /** Parse one line sent by the deck. Unknown lines become `log` events. */
@@ -91,7 +111,7 @@ export function parseLine(raw: string): DeviceEvent {
     case 'NET_STATUS':
       try {
         const status = JSON.parse(rest);
-        if (status && typeof status === 'object') return { type: 'netStatus', status };
+        if (status && typeof status === 'object') return { type: 'netStatus', status: sanitizeNetStatus(status) };
       } catch { /* fall through to log */ }
       break;
     case 'GET_TIME':

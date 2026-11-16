@@ -241,7 +241,8 @@ export function toDeviceButton(b: Button | null): Record<string, unknown> | null
       out.counterAction = a.counterAction ?? 'increment';
       break;
     case 'toggle': if (a.onColor) out.toggleData = { onColor: a.onColor }; break;
-    case 'http': out.http = { url: a.url, ...(a.method ? { method: a.method } : {}), ...(a.body ? { body: a.body } : {}), ...(a.headers ? { headers: a.headers } : {}) }; break;
+    // headers (often Authorization) are NOT copied to the deck: they would sit on the SD card and travel over the sync link
+    case 'http': out.http = { url: a.url, ...(a.method ? { method: a.method } : {}), ...(a.body ? { body: a.body } : {}) }; break;
     case 'media': out.media = a.key; break;
     case 'blehost': out.slot = a.slot; break;
     case 'ha': out.ha = { service: a.service, ...(a.entity ? { entity: a.entity } : {}), ...(a.data ? { data: a.data } : {}) }; break;

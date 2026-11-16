@@ -17,6 +17,20 @@ import { findDeck, listCandidatePorts, TcpTransport, Transport } from './transpo
 import { defaultCpuTimes, WidgetManager } from './widgets.js';
 import { weatherLine } from './weather.js';
 
+/** Copy of the config with every unresolved keychain:<name> value removed, so a literal reference is never sent anywhere as if it were a secret. */
+function stripRefs(cfg: Config): Config {
+  const walk = (v: unknown): unknown => {
+    if (Array.isArray(v)) return v.map(walk);
+    if (v && typeof v === 'object') {
+      const o: Record<string, unknown> = {};
+      for (const [k, x] of Object.entries(v)) { if (isKeychainRef(x)) continue; o[k] = walk(x); }
+      return o;
+    }
+    return v;
+  };
+  return walk(cfg) as Config;
+}
+
 const WEATHER_EVERY_MS = 15 * 60_000;
 const DIAG_EVERY_MS = 5_000;
 const SCHEDULE_EVERY_MS = 30_000;
@@ -68,7 +82,7 @@ export class Daemon implements DaemonApi {
     this.resolved = this.config;
     this.keychain = opts.keychain ?? (process.platform === 'darwin' ? new Keychain(securityRunner) : undefined);
     this.capture = opts.capture ?? defaultCapture;
-    this.fetchImpl = opts.fetchImpl ?? fetch;
+    this.fetchImpl = opts.fetchImpl ?? ((u, o) => fetch(u, { ...o, signal: o?.signal ?? AbortSignal.timeout(10_000) }));
     const ha = () => this.resolved.integrations?.homeassistant;
     this.exec = new ActionExecutor(opts.runner, (m) => this.log(m), this.fetchImpl, undefined, ha,
       (a) => this.alert(a.kind, a.seconds ?? 0, a.text ?? ''), (l) => this.send(l));
@@ -188,6 +202,8 @@ export class Daemon implements DaemonApi {
       if (c.sleepScreen) await this.deck.send(cmd.setSleepScreen(c.sleepScreen));
       await this.pushDiag();
       await this.pushWeather();
+      this.lastSched = undefined;
+      await this.applySchedule(); // saving inside a dim window must not leave the deck at full brightness
     } catch (e) {
       this.log(`apply settings: ${e instanceof Error ? e.message : e}`);
     }
@@ -219,14 +235,14 @@ export class Daemon implements DaemonApi {
     if (!this.keychain) {
       if (!this.secretWarned) this.log('config uses keychain: references but the macOS Keychain is not available here; those values will be empty');
       this.secretWarned = true;
-      this.resolved = this.config;
+      this.resolved = stripRefs(this.config);
       return;
     }
     try {
       this.resolved = await resolveConfigSecrets(this.config, this.keychain);
     } catch (e) {
       this.log(`keychain: ${e instanceof Error ? e.message : e}`);
-      this.resolved = this.config;
+      this.resolved = stripRefs(this.config);
     }
   }
 

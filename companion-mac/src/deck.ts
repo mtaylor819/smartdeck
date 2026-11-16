@@ -19,6 +19,8 @@ export class Deck extends EventEmitter {
   private draining = false;
   private page = 0;
   private waiters = new Set<(line: string) => boolean>();
+  private pending = new Set<{ cancel: (why: string) => void }>();
+  private uploading = false;
   private getConfig: () => Config;
   private hbTimer?: NodeJS.Timeout;
   /** Last NET_STATUS the deck reported (WiFi/BLE state). */
@@ -42,6 +44,7 @@ export class Deck extends EventEmitter {
     t.on('line', (line: string) => this.onLine(line));
     t.on('close', () => {
       if (this.hbTimer) clearInterval(this.hbTimer);
+      for (const e of [...this.pending]) e.cancel('link closed'); // no orphaned timers after a dropped link
       this.emit('close');
     });
   }
@@ -88,7 +91,10 @@ export class Deck extends EventEmitter {
     });
   }
 
+  /** Send one protocol line. Refuses embedded newlines (command injection) and anything during an upload (it would end up inside the file). */
   send(line: string): Promise<void> {
+    if (/[\r\n]/.test(line)) return Promise.reject(new Error('refusing to send a line containing a newline'));
+    if (this.uploading) return Promise.reject(new Error('upload in progress'));
     return this.t.write(line + '\n');
   }
 
@@ -195,19 +201,28 @@ export class Deck extends EventEmitter {
   }
 
   private waitFor(match: (line: string) => boolean, timeoutMs: number, what: string): Promise<string> {
-    return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        this.waiters.delete(w);
-        reject(new Error(`timed out waiting for ${what}`));
-      }, timeoutMs);
+    const p = new Promise<string>((resolve, reject) => {
+      const entry = {
+        cancel: (why: string) => {
+          clearTimeout(timer);
+          this.waiters.delete(w);
+          this.pending.delete(entry);
+          reject(new Error(why));
+        },
+      };
+      const timer = setTimeout(() => entry.cancel(`timed out waiting for ${what}`), timeoutMs);
       const w = (line: string) => {
         if (!match(line)) return false;
         clearTimeout(timer);
+        this.pending.delete(entry);
         resolve(line);
         return true;
       };
       this.waiters.add(w);
+      this.pending.add(entry);
     });
+    p.catch(() => {}); // an orphaned waiter (upload aborted, link dropped) must never become an unhandled rejection
+    return p;
   }
 
   /**
@@ -215,24 +230,32 @@ export class Deck extends EventEmitter {
    * Always include esp_config.json to replace the layout; JPGs are button icons.
    */
   async upload(files: UploadFile[]): Promise<void> {
+    if (this.uploading) throw new Error('an upload is already in progress');
+    for (const f of files) if (/[:/\\\r\n]/.test(f.name)) throw new Error(`bad upload filename: ${f.name}`);
+    this.uploading = true;
+    const line = (l: string) => this.t.write(l + '\n'); // internal: bypasses the upload guard in send()
     const expect = (m: string, ms = 5000) => this.waitFor((l) => l.trim() === m, ms, m);
-    let ready = expect('READY');
-    await this.send(cmd.startUpload());
-    await ready;
-    for (const f of files) {
-      if (/[:/\\\n]/.test(f.name)) throw new Error(`bad upload filename: ${f.name}`);
-      const ok = this.waitFor((l) => /^(OK_FILE|ERR_[A-Z_]+)/.test(l.trim()), 5000, 'OK_FILE');
-      await this.send(cmd.fileHeader(f.name, f.data.length));
-      const r = (await ok).trim();
-      if (r !== 'OK_FILE') throw new Error(`deck rejected ${f.name}: ${r}`);
-      const done = this.waitFor((l) => /^(OK_DATA|ERR_[A-Z_]+)/.test(l.trim()), 15000, 'OK_DATA');
-      await this.t.write(f.data);
-      const d = (await done).trim();
-      if (d !== 'OK_DATA') throw new Error(`upload of ${f.name} failed: ${d}`);
+    try {
+      const ready = expect('READY');
+      await line(cmd.startUpload());
+      await ready;
+      for (const f of files) {
+        const ok = this.waitFor((l) => /^(OK_FILE|ERR_[A-Z_]+)/.test(l.trim()), 5000, 'OK_FILE');
+        await line(cmd.fileHeader(f.name, f.data.length));
+        const r = (await ok).trim();
+        if (r !== 'OK_FILE') throw new Error(`deck rejected ${f.name}: ${r}`);
+        const done = this.waitFor((l) => /^(OK_DATA|ERR_[A-Z_]+)/.test(l.trim()), 15000, 'OK_DATA');
+        await this.t.write(f.data);
+        const d = (await done).trim();
+        if (d !== 'OK_DATA') throw new Error(`upload of ${f.name} failed: ${d}`);
+      }
+      const end = expect('DONE_REBOOT', 10000);
+      await line(cmd.endUpload());
+      await end;
+    } finally {
+      this.uploading = false;
+      for (const e of [...this.pending]) e.cancel('upload finished'); // drop any waiter left over from an aborted step
     }
-    const end = expect('DONE_REBOOT', 10000);
-    await this.send(cmd.endUpload());
-    await end;
   }
 
   /** Convenience: upload the current config as esp_config.json plus any icon files. */
