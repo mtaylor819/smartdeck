@@ -70,3 +70,40 @@ touch changed regions. Waking redraws the normal page as before. Binary size gre
   periodically, which would keep the deck awake forever. `SET_BTN_DATA` is now excluded from the wake path and skips the redraw while
   the deck is dimmed/deep-sleeping (waking redraws the page from the stored config anyway).
 - **Diagnostics sleep screen** (`SET_SLEEP_SCREEN` / `DIAG`), described above.
+
+## Optional: BLE HID keyboard + media keys (module `ble_hid.h`)
+
+Lets the deck act as a standalone Bluetooth keyboard on any machine (Mac, Windows, iPad, phone) when no host app is connected.
+**Compile-verified only; nothing has been paired with a real device.** Disabled until you send `SET_BLE` (stock behaviour unchanged).
+
+| Command | Effect |
+|---|---|
+| `SET_BLE:{"enabled":true,"name":"SmartDeck"}` | persisted (Preferences ns `ble`: `en`, `name`); replies `BLE_SET:ok` or `BLE_SET:err:bad_json\|no_fields\|bad_enabled\|bad_name`. Renaming restarts the BLE stack. |
+| `SET_BLE:{"clear_bonds":true}` | extension beyond PROTOCOL.md: forget all paired hosts (applied at next start if BLE is currently off) |
+
+- Pairing: Just Works + bonding (LE Secure Connections), bonds kept in NVS by NimBLE (NimBLE default: 3 bonds). Advertises with the
+  HID-keyboard appearance (0x03C1) and the HID service UUID; re-advertises after a disconnect.
+- Reports: keyboard (ID 1: modifiers + 6 keys) and consumer control (ID 2: play/pause, next, previous, volume +/-, mute).
+- Standalone buttons (only when no host app is connected and a BLE host is connected): `type:"key"` + `combo`, `type:"text"` + `text`,
+  `type:"media"` + `media`. Combo tokens match `companion-mac/src/keymap.ts` (all 104 key/alias/modifier names from that file were
+  cross-checked) plus `f1..f24`; `cmd|command|meta|win|super` = GUI. As in `keymap.ts`, `delete`/`backspace` = Backspace and `del`/`forwarddelete`
+  = forward delete.
+- Text is typed as **US-layout ASCII** (press/release, 10 ms spacing, queued, max 1024 chars per button press, non-blocking). The host
+  maps key codes to characters, so on a non-US layout symbols such as `@ " # £ ~ \` will come out wrong.
+- `NET_STATUS` gets `ble` (`off|advertising|connected`) and `ble_peer` from `ble_state_str()` / `ble_peer_str()`; state changes
+  call `net_status_changed()` from the main loop (not from the NimBLE task).
+- Size: app grew from ~546 KB to ~770 KB (24% of the 3 MB slot); static RAM 24 KB -> 35 KB.
+- **Radio sharing:** WiFi and BLE use the same 2.4 GHz radio; the ESP32 coexistence layer time-slices them. Expect somewhat higher
+  HID latency while WiFi is busy (e.g. during an OTA upload), and occasional extra WiFi latency while BLE connects.
+- Pure key mapping lives in `ble_keys.h` (no Arduino deps) so it can be unit-tested on a PC:
+  `g++ -std=c++17 -iquote JC8048W550/Arduino/smart_deck -o /tmp/bk firmware/tests/ble_keys_test.cpp && /tmp/bk` (use `-iquote`, not `-I`: the sketch folder contains a `features.h`
+  that would shadow the system `<features.h>`).
+
+### Vendored library
+`JC8048W550/Arduino/libraries/NimBLE-Arduino` = **h2zero/NimBLE-Arduino 1.4.3** (last 1.x release, built for arduino-esp32 2.0.x / IDF 4.4;
+the 2.x line has a different API). Source: `https://github.com/h2zero/NimBLE-Arduino/archive/refs/tags/1.4.3.zip`,
+zip sha256 `0f9770c49a49b5cf00e492124893f78baa4bf60f109ad1c34bef6bbc2c8c2cd7`. Only `src/`, `library.properties`, `LICENSE`
+(Apache-2.0), `README.md`, `CHANGELOG.md` are vendored (no examples/docs); no source edits.
+
+The pre-existing loose `JC8048W550/Arduino/libraries/esp_bt.h` is **not** a problem: arduino-cli only puts library *folders* on the include
+path, and the build dependency file for `NimBLEDevice.cpp` shows it compiled against the core's own `esp_bt.h`.
