@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="csrf-token" content="__CSRF_TOKEN__">
+  <title>SmartDeck</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header id="topbar">
+    <div class="brand">SmartDeck</div>
+    <div id="conn" class="conn off"><span class="dot"></span><span id="connText">Connecting…</span></div>
+    <div class="spacer"></div>
+    <button id="logBtn" class="ghost">Log</button>
+    <button id="settingsBtn" class="ghost">Settings</button>
+    <button id="syncBtn">Sync to deck</button>
+    <button id="saveBtn" class="primary" disabled>Save</button>
+  </header>
+  <div id="toast" role="status"></div>
+  <main>
+    <section id="editorView">
+      <nav id="tabs"></nav>
+      <div class="workspace">
+        <div id="gridWrap"><div id="grid"></div><p class="hint">Click a cell to edit · drag to move/swap buttons</p></div>
+        <aside id="panel"></aside>
+      </div>
+    </section>
+    <section id="settingsView" hidden></section>
+  </main>
+  <aside id="logDrawer" hidden><h3>Activity log</h3><pre id="logText"></pre></aside>
+  <script src="/app.js" defer></script>
+</body>
+</html>

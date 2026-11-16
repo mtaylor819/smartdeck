@@ -19,15 +19,21 @@ export class Deck extends EventEmitter {
   private draining = false;
   private page = 0;
   private waiters = new Set<(line: string) => boolean>();
+  private getConfig: () => Config;
+
+  private get config(): Config {
+    return this.getConfig();
+  }
 
   constructor(
     private t: Transport,
-    private config: Config,
+    cfg: Config | (() => Config),
     private exec: ActionExecutor,
     private log: (msg: string) => void = () => {},
     private now: () => Date = () => new Date(),
   ) {
     super();
+    this.getConfig = typeof cfg === 'function' ? cfg : () => cfg;
     t.on('line', (line: string) => this.onLine(line));
     t.on('close', () => this.emit('close'));
   }
@@ -38,6 +44,11 @@ export class Deck extends EventEmitter {
     await this.send(cmd.setBrightness(this.config.brightness));
     const led = this.config.knob.led;
     if (led) await this.send(cmd.setKnobLed(led.r, led.g, led.b, led.tail));
+    const pw = this.config.power;
+    if (pw?.sleepMinutes !== undefined) await this.send(cmd.setSleep(pw.sleepMinutes));
+    if (pw?.deepSleepMinutes !== undefined) await this.send(cmd.setDeepSleep(pw.deepSleepMinutes));
+    if (pw?.dimLed) await this.send(cmd.setDimLed(pw.dimLed));
+    if (pw?.ledBrightness !== undefined) await this.send(cmd.setLedBrightness(pw.ledBrightness));
     await this.send(cmd.getSync()); // deck replies with SYNC_PAGE / KNOB_RAW / SYNC_STATE...
   }
 

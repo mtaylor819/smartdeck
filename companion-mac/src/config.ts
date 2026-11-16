@@ -11,8 +11,25 @@ export interface ButtonStyle {
   icon?: string; // jpg filename on the SD card (see `icons/` upload)
 }
 
+export type WidgetSource = 'clock' | 'cpu' | 'memory' | 'nowplaying' | 'ha_state' | 'http_json' | 'moonraker';
+
+/** A button whose label/colour is refreshed live from a data source. */
+export interface Widget {
+  source: WidgetSource;
+  /** Seconds between refreshes. Minimum 10: every change rewrites the deck's SD card. */
+  interval?: number;
+  /** Template, `{value}` is replaced. e.g. "CPU {value}%" */
+  format?: string;
+  entity?: string; // ha_state
+  url?: string; // http_json / moonraker base URL
+  jsonPath?: string; // http_json: dot path e.g. "data.temp"
+  /** Highest matching threshold wins; numeric values only. */
+  thresholds?: Array<{ above: number; color: string }>;
+}
+
 export interface Button extends ButtonStyle {
   action: Action;
+  widget?: Widget;
 }
 
 export interface KnobConfig {
@@ -32,6 +49,15 @@ export interface Config {
   brightness: number;
   knob: KnobConfig;
   pages: Array<{ name: string; buttons: Array<Button | null> }>;
+  /** Deck power behaviour (firmware SET_SLEEP / SET_DEEP_SLEEP / SET_DIM_LED / SET_LED_BRIGHTNESS). */
+  power?: { sleepMinutes?: number; deepSleepMinutes?: number; dimLed?: string; ledBrightness?: number };
+  weather?: { lat: number; lon: number; celsius?: boolean; city?: string };
+  /** Switch deck page when this macOS app (by name) is frontmost. page is 0-based. */
+  appPages?: Array<{ app: string; page: number }>;
+  integrations?: {
+    homeassistant?: { url: string; token?: string; tokenEnv?: string };
+  };
+  ui?: { port?: number };
 }
 
 export const defaultConfig = (): Config => ({
@@ -84,7 +110,7 @@ export function loadConfig(path = configPath()): Config {
 export function writeDefaultConfig(path = configPath()): boolean {
   if (existsSync(path)) return false;
   mkdirSync(dirname(path), { recursive: true });
-  writeFileSync(path, JSON.stringify(defaultConfig(), null, 2) + '\n');
+  writeFileSync(path, JSON.stringify(defaultConfig(), null, 2) + '\n', { mode: 0o600 });
   return true;
 }
 

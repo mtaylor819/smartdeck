@@ -11,22 +11,28 @@ parameters such as app names, URLs and scripts never go to the device.
 
 | Area | State |
 |---|---|
-| Protocol parsing / command building | Done, unit-tested |
-| Config → device `esp_config.json`, upload handshake | Done, tested against a simulated firmware |
-| Knob (step, direction, wraparound, coalescing) | Done, tested |
-| Actions: key, text, app, website, script, sound, http, media, multi, toggle | Implemented, logic tested with a fake runner |
-| **Real macOS / real hardware** | **Not yet verified.** Built on Linux with no deck attached. |
-| Mouse action, weather, app-based page switching, visual editor, firmware flashing | Not started |
+| Serial protocol, upload handshake, config -> `esp_config.json` | Done, unit-tested against a simulated firmware |
+| Actions: key, text, paste, app, website, urlscheme, script, shortcut, applescript, mouse, media, sound, http, Home Assistant, multi, toggle | Implemented; logic tested with a fake runner |
+| Knob (steps, direction, wraparound), deck power/LED/brightness settings | Done, tested |
+| Live widgets (clock, cpu, memory, now playing, HA state, JSON URL, Moonraker) | Done, tested |
+| App-based page switching, weather (Open-Meteo) | Done, tested |
+| Web UI (localhost, CSRF/Host/Origin protected) | Served and API-checked; **not yet viewed in a browser** |
+| `flash` (esptool), `install-service` (launch at login) | Done; flashing unverified on hardware |
+| **Real macOS / real deck** | **Not yet verified** (built on Linux, no hardware) |
+
+See `ROADMAP.md` for what's next.
 
 ## Setup
 
 ```sh
 cd companion-mac
 npm install
-npm run start          # runs, auto-detects the deck, auto-reconnects
+npm run start          # daemon + UI at http://127.0.0.1:7777 (also: `open` command)
 npx tsx src/cli.ts init     # write the default config
 npx tsx src/cli.ts ports    # list candidate serial ports
-npx tsx src/cli.ts sync     # upload config + icons/*.jpg to the deck (it reboots)
+npx tsx src/cli.ts sync     # upload config + icons to the deck (it reboots); or use the UI button
+npx tsx src/cli.ts flash fw.bin   # flash firmware via esptool (pip3 install esptool)
+npm run build && node dist/cli.js install-service   # launch at login
 ```
 
 Config lives at `~/Library/Application Support/SmartDeckMac/config.json` (override with

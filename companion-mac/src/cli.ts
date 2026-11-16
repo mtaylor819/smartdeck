@@ -1,30 +1,16 @@
 #!/usr/bin/env node
-import { readdirSync, readFileSync, existsSync } from 'node:fs';
-import { join } from 'node:path';
-import { ActionExecutor } from './actions.js';
+import { execFile } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import { configPath, loadConfig, writeDefaultConfig } from './config.js';
-import { Deck, UploadFile } from './deck.js';
-import { findDeck, listCandidatePorts } from './transport.js';
-
-const log = (m: string) => console.log(`[${new Date().toLocaleTimeString()}] ${m}`);
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-
-async function connect(explicitPort?: string) {
-  const candidates = explicitPort ? [explicitPort] : await listCandidatePorts();
-  return findDeck(candidates);
-}
-
-function loadIcons(dir: string): UploadFile[] {
-  if (!existsSync(dir)) return [];
-  return readdirSync(dir)
-    .filter((f) => /\.jpe?g$/i.test(f))
-    .map((name) => ({ name, data: readFileSync(join(dir, name)) }));
-}
+import { Daemon } from './daemon.js';
+import { flashArgs, runEsptool, verifyChecksum } from './flash.js';
+import { startServer } from './server.js';
+import { installService } from './service.js';
+import { listCandidatePorts } from './transport.js';
 
 async function main() {
   const [command = 'run', ...rest] = process.argv.slice(2);
-  const portFlag = rest.indexOf('--port');
-  const port = portFlag >= 0 ? rest[portFlag + 1] : undefined;
+  const flag = (n: string) => (rest.includes(n) ? rest[rest.indexOf(n) + 1] : undefined);
 
   switch (command) {
     case 'init': {
@@ -32,43 +18,55 @@ async function main() {
       console.log(created ? `Wrote ${configPath()}` : `Config already exists: ${configPath()}`);
       return;
     }
-    case 'ports': {
+    case 'ports':
       for (const p of await listCandidatePorts()) console.log(p);
       return;
-    }
     case 'sync': {
-      // Upload the config (and ./icons/*.jpg next to it) to the deck. The deck reboots.
-      const config = loadConfig();
-      const found = await connect(port);
-      if (!found) throw new Error('No SmartDeck found. Is it plugged in? Try `ports` or --port.');
-      const deck = new Deck(found.transport, config, new ActionExecutor(undefined, log), log);
-      log(`Connected to "${found.name}", uploading...`);
-      await deck.uploadConfig(loadIcons(join(configPath(), '..', 'icons')));
-      log('Upload complete; the deck is rebooting.');
-      await deck.close();
+      // One-shot upload without the UI: stop the background service first (it owns the serial port).
+      const d = new Daemon({ port: flag('--port') });
+      void d.run();
+      for (let i = 0; i < 20 && !d.status().connected; i++) await new Promise((r) => setTimeout(r, 1000));
+      await d.sync();
+      await d.stop();
       return;
     }
     case 'run': {
-      writeDefaultConfig();
-      const config = loadConfig();
-      const exec = new ActionExecutor(undefined, log);
-      for (;;) {
-        const found = await connect(port);
-        if (!found) {
-          await sleep(2000);
-          continue;
-        }
-        log(`Connected to "${found.name}"`);
-        const deck = new Deck(found.transport, config, exec, log);
-        const closed = new Promise<void>((r) => deck.once('close', r));
-        found.transport.on('error', (e: Error) => log(`serial error: ${e.message}`));
-        await deck.start();
-        await closed;
-        log('Disconnected; reconnecting...');
-      }
+      const daemon = new Daemon({ port: flag('--port') });
+      const cfg = loadConfig();
+      const ui = await startServer(daemon, { port: cfg.ui?.port ?? 7777 });
+      console.log(`SmartDeck UI: ${ui.url}`);
+      const quit = async () => {
+        await ui.close();
+        await daemon.stop();
+        process.exit(0);
+      };
+      process.on('SIGINT', quit);
+      process.on('SIGTERM', quit);
+      await daemon.run();
+      return;
+    }
+    case 'flash': {
+      // smartdeck-mac flash <firmware.bin> [--port P]   (stop the background service first)
+      const bin = rest.find((a) => !a.startsWith('--') && a !== flag('--port'));
+      if (!bin) throw new Error('usage: smartdeck-mac flash <merged-firmware.bin> [--port /dev/cu.usbmodemXXXX]');
+      const port = flag('--port') ?? (await listCandidatePorts())[0];
+      if (!port) throw new Error('No serial port found. Hold BOOT while plugging in the deck, then retry.');
+      console.log(`Checksum: ${verifyChecksum(bin)}`);
+      await runEsptool(flashArgs(port, bin));
+      return;
+    }
+    case 'open': {
+      const port = loadConfig().ui?.port ?? 7777;
+      execFile('open', [`http://127.0.0.1:${port}/`]);
+      return;
+    }
+    case 'install-service': {
+      const { plist, commands } = installService(process.execPath, fileURLToPath(import.meta.url));
+      console.log(`Wrote ${plist}\nRun (after \`npm run build\`):\n  ${commands.join('\n  ')}`);
+      return;
     }
     default:
-      console.log('usage: smartdeck-mac [run|init|ports|sync] [--port /dev/cu.usbmodemXXXX]');
+      console.log('usage: smartdeck-mac [run|open|init|ports|sync|flash|install-service] [--port /dev/cu.usbmodemXXXX]');
       process.exitCode = 1;
   }
 }

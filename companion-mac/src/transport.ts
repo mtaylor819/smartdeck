@@ -56,7 +56,7 @@ export async function listCandidatePorts(): Promise<string[]> {
 export async function findDeck(
   candidates: string[],
   timeoutMs = 1500,
-): Promise<{ transport: SerialTransport; name: string } | null> {
+): Promise<{ transport: SerialTransport; name: string; path: string } | null> {
   for (const path of candidates) {
     let t: SerialTransport | undefined;
     try {
@@ -73,7 +73,7 @@ export async function findDeck(
       });
       if (name !== null) {
         t.removeAllListeners('line');
-        return { transport: t, name };
+        return { transport: t, name, path };
       }
       await t.close();
     } catch {

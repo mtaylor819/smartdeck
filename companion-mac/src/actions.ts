@@ -1,4 +1,7 @@
-import { spawn } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
+import { mkdtempSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { comboToAppleScript, parseCombo } from './keymap.js';
 
 export type Action =
@@ -16,6 +19,12 @@ export type Action =
   | { type: 'timer'; duration: number }
   | { type: 'counter'; counterStartValue?: number; counterAction?: 'increment' | 'decrement' | 'reset' }
   | { type: 'toggle'; on?: Action; off?: Action; onColor?: string }
+  | { type: 'mouse'; op: 'click' | 'double' | 'right' | 'move' | 'scroll'; x?: number; y?: number; dx?: number; dy?: number }
+  | { type: 'shortcut'; name: string; input?: string }
+  | { type: 'applescript'; script: string }
+  | { type: 'urlscheme'; url: string }
+  | { type: 'paste'; text: string }
+  | { type: 'ha'; service: string; entity?: string; data?: Record<string, unknown> }
   | { type: 'none' };
 
 export type MediaKey =
@@ -54,6 +63,53 @@ function send(down) {
 }
 send(true); send(false);`;
 
+/** Runs a process and returns its stdout. */
+export type Capture = (file: string, args: string[]) => Promise<string>;
+
+export const defaultCapture: Capture = (file, args) =>
+  new Promise((resolve, reject) =>
+    execFile(file, args, { timeout: 10_000, maxBuffer: 1 << 20 }, (err, stdout) =>
+      err ? reject(err) : resolve(stdout.toString()),
+    ),
+  );
+
+export interface HaSettings {
+  url: string;
+  token?: string;
+  tokenEnv?: string;
+}
+
+/** JXA mouse events via CGEvent. Needs Accessibility permission. */
+export function mouseScript(a: Extract<Action, { type: 'mouse' }>): string {
+  const num = (n: number | undefined) => (Number.isFinite(n) ? Number(n) : 0);
+  const head = `ObjC.import('Cocoa');
+function pos(){ var e=$.CGEventCreate(null); return $.CGEventGetLocation(e); }
+function post(t,p,b){ var e=$.CGEventCreateMouseEvent(null,t,p,b); $.CGEventPost(0,e); }
+function pt(x,y){ return {x:x,y:y}; }`;
+  const at = a.x !== undefined && a.y !== undefined ? `pt(${num(a.x)},${num(a.y)})` : 'pos()';
+  switch (a.op) {
+    case 'move':
+      return `${head}
+post($.kCGEventMouseMoved, ${at}, 0);`;
+    case 'click':
+      return `${head}
+var p=${at}; post($.kCGEventLeftMouseDown,p,0); post($.kCGEventLeftMouseUp,p,0);`;
+    case 'right':
+      return `${head}
+var p=${at}; post($.kCGEventRightMouseDown,p,1); post($.kCGEventRightMouseUp,p,1);`;
+    case 'double':
+      return `${head}
+var p=${at};
+for (var i=1;i<=2;i++){ var d=$.CGEventCreateMouseEvent(null,$.kCGEventLeftMouseDown,p,0);
+  $.CGEventSetIntegerValueField(d,1,i); $.CGEventPost(0,d);
+  var u=$.CGEventCreateMouseEvent(null,$.kCGEventLeftMouseUp,p,0);
+  $.CGEventSetIntegerValueField(u,1,i); $.CGEventPost(0,u); }`;
+    case 'scroll':
+      return `${head}
+var e=$.CGEventCreateScrollWheelEvent(null,0,2,${-num(a.dy)},${num(a.dx)}); $.CGEventPost(0,e);`;
+  }
+}
+
 const asString = (s: string) => `"${s.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
 
 export class ActionExecutor {
@@ -62,6 +118,7 @@ export class ActionExecutor {
     private log: (msg: string) => void = () => {},
     private fetchImpl: typeof fetch = fetch,
     private sleep: (ms: number) => Promise<void> = (ms) => new Promise((r) => setTimeout(r, ms)),
+    private ha: () => HaSettings | undefined = () => undefined,
   ) {}
 
   /** Execute an action. `toggleState` is the state the deck reports for toggle buttons. */
@@ -91,6 +148,31 @@ export class ActionExecutor {
         if (!res.ok) throw new Error(`HTTP ${res.status} from ${action.url}`);
         return;
       }
+      case 'mouse':
+        return this.run('osascript', ['-l', 'JavaScript', '-e', mouseScript(action)]);
+      case 'shortcut': {
+        const args = ['run', action.name];
+        if (action.input !== undefined) {
+          const f = join(mkdtempSync(join(tmpdir(), 'smartdeck-')), 'input.txt');
+          writeFileSync(f, action.input, { mode: 0o600 });
+          args.push('-i', f);
+        }
+        return this.run('shortcuts', args, { detached: true });
+      }
+      case 'applescript':
+        return this.osa(action.script);
+      case 'urlscheme':
+        if (!/^[a-z][a-z0-9+.-]*:/i.test(action.url) || /^(file|javascript|data):/i.test(action.url))
+          throw new Error(`Refusing URL scheme: ${action.url}`);
+        return this.run('open', [action.url]);
+      case 'paste':
+        return this.osa(
+          `set old to the clipboard\nset the clipboard to ${asString(action.text)}\n` +
+            `tell application "System Events" to keystroke "v" using {command down}\n` +
+            `delay 0.4\ntry\nset the clipboard to old\nend try`,
+        );
+      case 'ha':
+        return this.callHomeAssistant(action);
       case 'delay':
         return this.sleep(action.ms);
       case 'multi':
@@ -111,6 +193,20 @@ export class ActionExecutor {
         this.log(`Unsupported action type "${t}"`);
       }
     }
+  }
+
+  private async callHomeAssistant(a: Extract<Action, { type: 'ha' }>): Promise<void> {
+    const ha = this.ha();
+    const token = ha?.token || (ha?.tokenEnv ? process.env[ha.tokenEnv] : undefined);
+    if (!ha?.url || !token) throw new Error('Home Assistant is not configured (url + token)');
+    const m = /^([a-z_]+)\.([a-z0-9_]+)$/.exec(a.service);
+    if (!m) throw new Error(`Bad HA service "${a.service}" (expected domain.service)`);
+    const res = await this.fetchImpl(`${ha.url.replace(/\/+$/, '')}/api/services/${m[1]}/${m[2]}`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...(a.entity ? { entity_id: a.entity } : {}), ...a.data }),
+    });
+    if (!res.ok) throw new Error(`Home Assistant ${a.service}: HTTP ${res.status}`);
   }
 
   private osa(script: string): Promise<void> {
