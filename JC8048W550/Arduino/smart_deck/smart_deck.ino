@@ -91,6 +91,15 @@ unsigned long dr_rx, dr_tx, dr_up;     // last drawn values
 int dr_hour, dr_min;
 char dr_host[17];
 
+/* --- Sleep screen mode (see anim.h): 0 clock (default), 1 diag, 2 diag-anim (animated diagnostics), 3 warp (animated starfield) --- */
+#define SLM_CLOCK 0
+#define SLM_DIAG 1
+#define SLM_DIAG_ANIM 2
+#define SLM_WARP 3
+uint8_t sleep_screen_mode = SLM_CLOCK;  // sleep_screen_diag is kept in sync (true for diag + diag-anim)
+unsigned long diag_frame_gen = 0;       // bumped every time the static diagnostics frame is repainted (anim.h resets its overlays)
+void anim_warp_draw();                  // anim.h
+
 /* --- Deep Sleep Mode (screen & LED off) --- */
 bool deep_sleep_enabled = false;                       // Is deep sleep enabled?
 unsigned long deep_sleep_timeout_ms = 30 * 60 * 1000;  // Default 30 min after dim
@@ -828,6 +837,7 @@ static void diag_draw() {
     gfx->fillScreen(BLACK);
     diag_draw_static();
     diag_frame_drawn = true;
+    diag_frame_gen++;
     diag_drawn_valid = false;
   }
   diag_draw_dynamic();
@@ -934,6 +944,10 @@ void draw_sleep_clock_classic() {
 // Sleep screen entry point used by all existing call sites: diagnostics when selected and
 // fresh DIAG data is available, otherwise the original clock/weather screen.
 void draw_sleep_clock() {
+  if (sleep_screen_mode == SLM_WARP) {  // animated warp screen (anim.h); needs no host data
+    anim_warp_draw();
+    return;
+  }
   if (diag_active()) {
     diag_draw();
     return;
@@ -3084,8 +3098,13 @@ void loop() {
 
     int radius = CORNER_RADIUS;
 
+    // --- GESTURES (gestures.h): swipe changes page and CONSUMES the touch; hold:true buttons emit BTN_HOLD ---
+    if (gestures_touch(is_touched_now, touch_x > 0 && touch_y > 0, touch_x, touch_y, current_touched_button_index, currentMillis)) {
+      // swipe handled: skip press/hold/release for this poll (was_touched is still updated below)
+    }
+
     // --- A. BASMA ANI (Press) ---
-    if (is_touched_now && current_touched_button_index != -1 && last_touched_button_index != current_touched_button_index) {
+    else if (is_touched_now && current_touched_button_index != -1 && last_touched_button_index != current_touched_button_index) {
       touch_start_time = millis();
       long_press_triggered = false;
 
