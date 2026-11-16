@@ -4,6 +4,7 @@
  * */
 
 #include "config.h"
+#include "live_table.h"  // [live] RAM-only per-button display overrides (consulted by draw_single_button)
 
 // Receiver MAC for ESP-NOW dongle mode
 uint8_t receiver_mac[] = RECEIVER_MAC;
@@ -1555,6 +1556,7 @@ void draw_single_button(int btn_index) {
   }
 
   JsonObject button_cfg = button_variant.as<JsonObject>();
+  const LiveOv* live_ov = live_find(current_page, btn_index);  // [live] RAM-only overrides from SET_BTN_LIVE / HA state (live_table.h)
 
   // --- 0. SHADOW DRAWING [NEWLY ADDED] ---
   // Before the button itself, we draw a dark colored box 5px to the right and 5px down.
@@ -1571,6 +1573,7 @@ void draw_single_button(int btn_index) {
   if (btn_info.action == "toggle" && current_toggles[btn_index].state) {
     bg_color = current_toggles[btn_index].onColor;
   }
+  if (live_ov && (live_ov->flags & LIVE_F_BTN)) bg_color = live_ov->btn;  // [live]
 
   // Draw background
   gfx->fillRoundRect(x_pos, y_pos, CELL_W, CELL_H, radius, bg_color);
@@ -1590,6 +1593,7 @@ void draw_single_button(int btn_index) {
       }
     } else {
       const char* icon_file_ptr = button_cfg["icon"];
+      if (live_ov && (live_ov->flags & LIVE_F_ICON)) icon_file_ptr = live_ov->icon;  // [live]
       if (icon_file_ptr) {
         fileToDraw = "/" + String(icon_file_ptr);
       }
@@ -1654,18 +1658,49 @@ void draw_single_button(int btn_index) {
     label_text = counter_str;
   } else {
     label_text = NULL;
+    // [live] Stock firmware draws NO label text for normal buttons (the Windows app bakes it into the icon JPG).
+    // A live label always draws; with LIVE_LABEL_FALLBACK (live_table.h) icon-less buttons draw their "label" too.
+    if (live_ov && (live_ov->flags & LIVE_F_LABEL)) label_text = live_ov->label;
+#if LIVE_LABEL_FALLBACK
+    else if (fileToDraw.length() <= 1) label_text = button_cfg["label"];
+#endif
+  }
+  if (live_ov && (live_ov->flags & LIVE_F_SIZE)) label_size_px = live_ov->labelSize;  // [live]
+
+  // [live] Fit a (possibly long) normal-button label into the cell: shrink the font, then trim characters.
+  char live_fit[LIVE_LABEL_MAX + 1];
+  bool live_is_text_btn = (btn_info.action != "timer" && btn_info.action != "counter");
+  int live_fit_size = 0;
+  if (label_text && live_is_text_btn) {
+    strncpy(live_fit, label_text, LIVE_LABEL_MAX);
+    live_fit[LIVE_LABEL_MAX] = '\0';
+    label_text = live_fit;
+    int16_t fx, fy;
+    uint16_t fw, fh;
+    live_fit_size = mapFontSize(label_size_px);
+    for (;;) {
+      gfx->setTextSize(live_fit_size);
+      gfx->getTextBounds(live_fit, 0, 0, &fx, &fy, &fw, &fh);
+      if (fw <= (uint16_t)(CELL_W - 10)) break;
+      if (live_fit_size > 1) live_fit_size--;
+      else if (strlen(live_fit) > 1) live_fit[strlen(live_fit) - 1] = '\0';
+      else break;
+    }
   }
 
   if (label_text) {
     int final_font_size = mapFontSize(label_size_px);
     if ((btn_info.action == "timer" || btn_info.action == "counter")) {
       final_font_size = 3;
+    } else if (live_fit_size > 0) {
+      final_font_size = live_fit_size;  // [live] size chosen by the fit loop above
     }
 
     gfx->setTextSize(final_font_size);
     uint16_t text_color_to_use = theme_text_color_rgb565;
     const char* label_color_hex = button_cfg["labelColor"];
     if (label_color_hex) text_color_to_use = hex_to_rgb565(label_color_hex);
+    if (live_ov && (live_ov->flags & LIVE_F_LCOLOR)) text_color_to_use = live_ov->lcolor;  // [live]
 
     gfx->setTextColor(text_color_to_use);
 
