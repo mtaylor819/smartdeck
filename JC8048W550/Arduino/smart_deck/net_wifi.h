@@ -15,10 +15,14 @@
 #include <HTTPClient.h>
 #include <Update.h>
 #include <esp_ota_ops.h>
+#include <esp_system.h>  // esp_random()
+#include <mbedtls/sha256.h>
+#include <lwip/sockets.h>
 #include <time.h>
 #include <vector>
+#include "net_auth_logic.h"  // [v4] pure HMAC / per-IP lockout / validators (unit-tested on a PC)
 
-#define NET_FW_VERSION "2.5.1-mac0"
+#define NET_FW_VERSION "2.5.1-mac1"  // mac1 = v4 security protocol (HMAC auth, signed OTA)
 static const uint16_t NET_TCP_PORT = 7778;  // host link (AUTH + protocol lines)
 static const uint16_t NET_OTA_PORT = 7779;  // HTTP POST /update
 
@@ -50,19 +54,27 @@ static unsigned long net_backoff_ms = 1000;
 static unsigned long net_apply_at = 0;  // deferred application of SET_NET (lets the reply flush first)
 static unsigned long net_last_status_ms = 0;
 
-// Auth failure throttle shared by the TCP link and OTA.
-static uint8_t net_auth_fails = 0;
-static unsigned long net_lockout_until = 0;
+// [v4] Auth failure throttle: PER SOURCE IP (shared by the TCP link and OTA), so a hostile device cannot lock out the real Mac.
+static NaIpTable net_ip_table;
 
 static WiFiServer net_tcp_server(NET_TCP_PORT);
 static WiFiServer net_ota_server(NET_OTA_PORT);
 static bool net_services_up = false;
 
 static WiFiClient net_tcp_auth;  // authenticated host link
-static WiFiClient net_tcp_pend;  // connected, waiting for AUTH
-static unsigned long net_tcp_pend_since = 0;
-static char net_tcp_pend_buf[160];
-static size_t net_tcp_pend_len = 0;
+static uint32_t net_tcp_auth_ip = 0;
+// [v4] Up to 3 connections waiting for their AUTH (each already holds its own CHALLENGE nonce). A new connection evicts the oldest.
+#define NET_PEND_SLOTS 3
+struct NetPend {
+  WiFiClient c;
+  unsigned long since = 0;
+  char buf[160];
+  size_t len = 0;
+  char nonce[33] = {0};
+  uint32_t ip = 0;
+  bool used = false;
+};
+static NetPend net_pend[NET_PEND_SLOTS];
 static String net_tcp_line;
 static bool net_tcp_overflow = false;
 static bool net_tcp_was_up = false;
@@ -75,33 +87,30 @@ static unsigned long net_last_host_time_ms = 0;  // when a host last sent SET_TI
 // ---------------------------------------------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------------------------------------------
-static bool net_ct_equal(const String& a, const String& b) {
-  // Constant-time w.r.t. content; length difference is folded into the result.
-  size_t n = a.length() > b.length() ? a.length() : b.length();
-  uint8_t diff = (uint8_t)(a.length() != b.length());
-  for (size_t i = 0; i < n; i++) {
-    uint8_t x = i < a.length() ? (uint8_t)a[i] : 0;
-    uint8_t y = i < b.length() ? (uint8_t)b[i] : 0;
-    diff |= x ^ y;
+// [v4] Per-IP lockout wrappers (logic lives in net_auth_logic.h and is unit-tested on a PC).
+static bool net_locked_out(uint32_t ip) { return net_ip_table.isLocked(ip, (uint32_t)millis()); }
+static void net_note_auth_fail(uint32_t ip) { net_ip_table.noteFail(ip, (uint32_t)millis()); }
+static void net_note_auth_ok(uint32_t ip) { net_ip_table.noteSuccess(ip); }
+
+static void net_sha256_oneshot(const uint8_t* d, size_t n, uint8_t out[32]) { mbedtls_sha256_ret(d, n, out, 0); }
+
+// 16 random bytes from the hardware RNG as 32 lowercase hex chars (needs 33 bytes).
+static void net_random_nonce(char out[33]) {
+  uint8_t b[16];
+  for (int i = 0; i < 4; i++) {
+    uint32_t r = esp_random();
+    memcpy(b + 4 * i, &r, 4);
   }
-  return diff == 0;
+  na_hex(b, 16, out);
 }
 
-static bool net_locked_out() {
-  if (net_lockout_until == 0) return false;
-  if ((long)(millis() - net_lockout_until) >= 0) {
-    net_lockout_until = 0;
-    net_auth_fails = 0;
-    return false;
-  }
-  return true;
-}
-
-static void net_note_auth_fail() {
-  if (++net_auth_fails >= 5) {
-    net_lockout_until = millis() + 30000UL;
-    if (net_lockout_until == 0) net_lockout_until = 1;
-  }
+// out = hex(HMAC(token, prefix + nonce [+ ":" + extra])). Returns false if there is no usable token (< 8 chars).
+static bool net_hmac_for(const char* prefix, const char* nonce, const char* extra, char out[65]) {
+  if (net_cfg.token.length() < 8) return false;
+  char msg[NA_HMAC_MAX_MSG + 1];
+  int n = snprintf(msg, sizeof(msg), extra ? "%s%s:%s" : "%s%s", prefix, nonce, extra ? extra : "");
+  if (n <= 0 || n > NA_HMAC_MAX_MSG) return false;
+  return na_hmac_hex(net_sha256_oneshot, net_cfg.token.c_str(), msg, out);
 }
 
 static bool net_printable_token(const String& s, size_t lo, size_t hi) {
@@ -187,6 +196,43 @@ static void net_emit_status() {
 // ---------------------------------------------------------------------------------------------------------------
 // SET_NET
 // ---------------------------------------------------------------------------------------------------------------
+// Write a string key only if it changed, then read it back. The sentinel default can never equal a validated value.
+static bool net_put_str(const char* k, const String& v) {
+  const String sentinel = "\x01<unset>";
+  if (net_prefs.getString(k, sentinel) == v) return true;  // unchanged: no flash write, no wear
+  net_prefs.putString(k, v);
+  return net_prefs.getString(k, sentinel) == v;
+}
+static bool net_put_u8(const char* k, uint8_t v) {
+  if (net_prefs.isKey(k) && net_prefs.getUChar(k, (uint8_t)(v ^ 0xFF)) == v) return true;
+  net_prefs.putUChar(k, v);
+  return net_prefs.isKey(k) && net_prefs.getUChar(k, (uint8_t)(v ^ 0xFF)) == v;
+}
+static bool net_put_bool(const char* k, bool v) {
+  if (net_prefs.isKey(k) && net_prefs.getBool(k, !v) == v) return true;
+  net_prefs.putBool(k, v);
+  return net_prefs.isKey(k) && net_prefs.getBool(k, !v) == v;
+}
+static bool net_write_all(const NetConfig& n) {
+  bool ok = true;
+  ok &= net_put_str("ssid", n.ssid);
+  ok &= net_put_str("pass", n.pass);
+  ok &= net_put_str("host", n.host);
+  ok &= net_put_str("token", n.token);
+  ok &= net_put_str("ha_url", n.haUrl);
+  ok &= net_put_str("ha_tok", n.haToken);
+  ok &= net_put_str("tz", n.tz);
+  ok &= net_put_u8("sa", n.standalone);
+  ok &= net_put_bool("wifi", n.wifi);
+  return ok;
+}
+// Commit `n`; on any failure best-effort restore the previous values so flash keeps matching the (unchanged) RAM config.
+static bool net_commit_config(const NetConfig& n) {
+  if (net_write_all(n)) return true;
+  net_write_all(net_cfg);
+  return false;
+}
+
 // Returns nullptr on success, else a fixed error token (never echoes values).
 static const char* net_apply_set_net(const String& body) {
   if (body.length() > 2048) return "too_long";
@@ -249,16 +295,9 @@ static const char* net_apply_set_net(const String& body) {
     n.wifi = d["wifi"].as<bool>();
   }
 
-  // Commit (all validated).
-  net_prefs.putString("ssid", n.ssid);
-  net_prefs.putString("pass", n.pass);
-  net_prefs.putString("host", n.host);
-  net_prefs.putString("token", n.token);
-  net_prefs.putString("ha_url", n.haUrl);
-  net_prefs.putString("ha_tok", n.haToken);
-  net_prefs.putString("tz", n.tz);
-  net_prefs.putUChar("sa", n.standalone);
-  net_prefs.putBool("wifi", n.wifi);
+  // Commit (all validated). [v4] Only CHANGED keys are written, each is read back to prove it stuck, and RAM is only
+  // updated if every write succeeded (a full NVS must not leave RAM and flash disagreeing after the next reboot).
+  if (!net_commit_config(n)) return "nvs";
   net_cfg = n;
 
   // Defer reconnect so the "NET_SET:ok" reply can leave over the (possibly WiFi) link first.
@@ -277,7 +316,10 @@ static const char* net_apply_set_net(const String& body) {
 static void net_stop_services() {
   if (!net_services_up) return;
   net_tcp_auth.stop();
-  net_tcp_pend.stop();
+  for (int i = 0; i < NET_PEND_SLOTS; i++) {
+    net_pend[i].c.stop();
+    net_pend[i].used = false;
+  }
   Serial.setTcp(nullptr);
   net_tcp_server.end();
   net_ota_server.end();
@@ -372,27 +414,55 @@ static void net_wifi_tick() {
 // ---------------------------------------------------------------------------------------------------------------
 // TCP host link (port 7778)
 // ---------------------------------------------------------------------------------------------------------------
-static void net_tcp_reject(WiFiClient& c) {
-  c.stop();
+// [v4] Mutual HMAC challenge-response (see PROTOCOL.md "v4"). The token itself never crosses the network:
+//   deck -> CHALLENGE:<32 hex nonce>      client -> AUTH:<hex HMAC(token, "client:"+nonce)>
+//   deck -> AUTH_OK:<hex HMAC(token, "deck:"+nonce)>   (the client verifies this: an impostor deck cannot produce it)
+static void net_tcp_keepalive(WiFiClient& c) {
+  int fd = c.fd();
+  if (fd < 0) return;
+  int on = 1, idle = 10, intvl = 5, cnt = 3;  // dead peer dropped after ~25 s (Mac asleep / WiFi gone without a FIN)
+  setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &on, sizeof(on));
+  setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
+  setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
+  setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt));
 }
 
-static void net_tcp_process_auth_line(const String& line) {
+static void net_pend_drop(NetPend& p) {
+  p.c.stop();
+  p.used = false;
+  p.len = 0;
+}
+
+static void net_tcp_process_auth_line(NetPend& p, const char* line, size_t len) {
   bool ok = false;
-  if (line.startsWith("AUTH:") && net_cfg.token.length() >= 8) ok = net_ct_equal(line.substring(5), net_cfg.token);
+  char exp[65];
+  if (len >= 5 && strncmp(line, "AUTH:", 5) == 0 && net_hmac_for("client:", p.nonce, nullptr, exp))
+    ok = na_hmac_matches(line + 5, len - 5, exp);  // fixed 64-byte compare; length mismatch folded in afterwards
   if (!ok) {
-    net_note_auth_fail();
-    net_tcp_pend.print("AUTH_FAIL\n");
-    net_tcp_pend.flush();
-    net_tcp_pend.stop();
+    net_note_auth_fail(p.ip);
+    p.c.print("AUTH_FAIL\n");
+    p.c.flush();
+    net_pend_drop(p);
     return;
   }
-  net_auth_fails = 0;
-  net_tcp_pend.print("AUTH_OK\n");
+  char deck[65];
+  if (!net_hmac_for("deck:", p.nonce, nullptr, deck)) {  // cannot happen (token was just used), but never send garbage
+    net_pend_drop(p);
+    return;
+  }
+  net_note_auth_ok(p.ip);
+  p.c.print("AUTH_OK:");
+  p.c.print(deck);
+  p.c.print("\n");
   if (net_tcp_auth.connected()) net_tcp_auth.stop();  // newest authenticated client replaces the old one
   Serial.setTcp(nullptr);
-  net_tcp_auth = net_tcp_pend;  // shares the socket handle
-  net_tcp_pend = WiFiClient();  // drop our extra reference WITHOUT closing the socket
+  net_tcp_auth = p.c;  // shares the socket handle
+  net_tcp_auth_ip = p.ip;
+  p.c = WiFiClient();  // drop our extra reference WITHOUT closing the socket
+  p.used = false;
+  p.len = 0;
   net_tcp_auth.setNoDelay(true);
+  net_tcp_keepalive(net_tcp_auth);
   net_tcp_line = "";
   net_tcp_overflow = false;
   Serial.setTcp(&net_tcp_auth);
@@ -401,46 +471,75 @@ static void net_tcp_process_auth_line(const String& line) {
 
 static void net_tcp_tick() {
   if (!net_services_up) return;
+  unsigned long now = millis();
 
-  // new connections
+  // new connections: refused if that IP is locked out; otherwise take a free pending slot, evicting the OLDEST pending one
   WiFiClient nc = net_tcp_server.available();
   if (nc) {
-    if (net_locked_out() || net_tcp_pend.connected()) {
-      net_tcp_reject(nc);
+    uint32_t ip = (uint32_t)nc.remoteIP();
+    if (net_locked_out(ip)) {
+      nc.stop();
     } else {
-      net_tcp_pend = nc;
-      net_tcp_pend.setNoDelay(true);
-      net_tcp_pend_since = millis();
-      net_tcp_pend_len = 0;
+      NetPend* slot = nullptr;
+      for (int i = 0; i < NET_PEND_SLOTS && !slot; i++)
+        if (!net_pend[i].used) slot = &net_pend[i];
+      if (!slot) {
+        slot = &net_pend[0];
+        for (int i = 1; i < NET_PEND_SLOTS; i++)
+          if ((long)(net_pend[i].since - slot->since) < 0) slot = &net_pend[i];
+        slot->c.stop();  // an idle connection must not be able to starve real clients
+      }
+      slot->c = nc;
+      slot->c.setNoDelay(true);
+      slot->since = now;
+      slot->len = 0;
+      slot->ip = ip;
+      slot->used = true;
+      net_random_nonce(slot->nonce);
+      slot->c.print("CHALLENGE:");
+      slot->c.print(slot->nonce);
+      slot->c.print("\n");
     }
   }
 
-  // pending client: waiting for "AUTH:<token>\n"
-  if (net_tcp_pend.connected()) {
+  // pending clients: each must answer its CHALLENGE with "AUTH:<hmac>\n" within 5 s
+  for (int i = 0; i < NET_PEND_SLOTS; i++) {
+    NetPend& p = net_pend[i];
+    if (!p.used) continue;
     bool done = false;
-    while (!done && net_tcp_pend.available() > 0) {
-      int ch = net_tcp_pend.read();
+    while (!done && p.c.available() > 0) {
+      int ch = p.c.read();
       if (ch < 0) break;
       if (ch == '\r') continue;
       if (ch == '\n') {
-        net_tcp_pend_buf[net_tcp_pend_len] = 0;
-        String line(net_tcp_pend_buf);
-        net_tcp_pend_len = 0;
-        net_tcp_process_auth_line(line);
+        p.buf[p.len] = 0;
+        size_t len = p.len;
+        p.len = 0;
+        net_tcp_process_auth_line(p, p.buf, len);  // always ends the pending state (success hands the socket over)
         done = true;
-      } else if (net_tcp_pend_len < sizeof(net_tcp_pend_buf) - 1) {
-        net_tcp_pend_buf[net_tcp_pend_len++] = (char)ch;
+      } else if (p.len < sizeof(p.buf) - 1) {
+        p.buf[p.len++] = (char)ch;
       } else {  // absurdly long first line
-        net_note_auth_fail();
-        net_tcp_pend.stop();
+        net_note_auth_fail(p.ip);
+        net_pend_drop(p);
         done = true;
       }
     }
-    if (!done && net_tcp_pend.connected() && (millis() - net_tcp_pend_since) > 5000UL) net_tcp_pend.stop();  // idle, no AUTH
+    if (done || !p.used) continue;
+    if (!p.c.connected() && p.c.available() == 0) {  // peer left without answering
+      net_pend_drop(p);
+    } else if ((now - p.since) > 5000UL) {  // idle, no AUTH: counts as a failure for that IP (limits connection-churn attacks)
+      net_note_auth_fail(p.ip);
+      net_pend_drop(p);
+    }
   }
 
-  // authenticated client liveness
+  // authenticated client liveness (a vanished peer is caught by keepalive; a stalled one by the HostIO stall counter)
   bool up = net_tcp_auth.connected();
+  if (up && Serial.tcpStalled()) {
+    net_tcp_auth.stop();
+    up = false;
+  }
   if (net_tcp_was_up && !up) {
     Serial.setTcp(nullptr);
     net_tcp_auth.stop();
@@ -480,20 +579,64 @@ bool net_tcp_take_line(String& out) {
 // ---------------------------------------------------------------------------------------------------------------
 // OTA (HTTP POST /update on 7779)
 // ---------------------------------------------------------------------------------------------------------------
+// [v4] Flow (PROTOCOL.md "v4"): GET /challenge -> nonce; POST /update with X-SmartDeck-Nonce, X-SmartDeck-Sha256 (hash of the
+// body) and X-SmartDeck-Auth = hex HMAC(token, "ota:"+nonce+":"+sha256). The nonce is single use, the auth is verified BEFORE
+// any flash is touched, and the streamed body's SHA-256 must equal the signed hash or the update is aborted (no reboot).
 enum NetOtaState { OTA_IDLE, OTA_HEADERS, OTA_BODY };
 static NetOtaState net_ota_state = OTA_IDLE;
 static WiFiClient net_ota_client;
+static uint32_t net_ota_ip = 0;
 static unsigned long net_ota_since = 0;       // when the current state began / last data seen
 static String net_ota_hdr_line;
 static size_t net_ota_hdr_bytes = 0;
-static String net_ota_method, net_ota_path, net_ota_token_hdr;
+static String net_ota_method, net_ota_path, net_ota_nonce_hdr, net_ota_sha_hdr, net_ota_auth_hdr;
 static long net_ota_len = -1;
 static uint8_t net_ota_head[64];
 static size_t net_ota_head_len = 0;
 static bool net_ota_begun = false;
 static size_t net_ota_received = 0;
 static int net_ota_last_pct = -1;
+static mbedtls_sha256_context net_ota_sha;
+static bool net_ota_sha_live = false;
 static bool net_ota_in_progress() { return net_ota_state == OTA_BODY; }
+
+// Single-use nonces handed out by GET /challenge: at most 4 outstanding (oldest evicted), valid 60 s.
+#define NET_OTA_NONCES 4
+struct NetOtaNonce {
+  char nonce[33];
+  unsigned long created;
+  bool used;
+};
+static NetOtaNonce net_ota_nonces[NET_OTA_NONCES];
+
+static void net_ota_issue_nonce(char out[33]) {
+  int slot = -1;
+  for (int i = 0; i < NET_OTA_NONCES && slot < 0; i++)
+    if (!net_ota_nonces[i].used) slot = i;
+  if (slot < 0) {  // all busy: evict the oldest
+    slot = 0;
+    for (int i = 1; i < NET_OTA_NONCES; i++)
+      if ((long)(net_ota_nonces[i].created - net_ota_nonces[slot].created) < 0) slot = i;
+  }
+  net_random_nonce(net_ota_nonces[slot].nonce);
+  net_ota_nonces[slot].created = millis();
+  net_ota_nonces[slot].used = true;
+  memcpy(out, net_ota_nonces[slot].nonce, 33);
+}
+
+// Consumes the nonce whether or not it was valid-and-fresh (a nonce is good for exactly one attempt).
+static bool net_ota_take_nonce(const String& n) {
+  if (n.length() != 32 || !na_is_hex_lower(n.c_str(), 32)) return false;
+  bool found = false;
+  for (int i = 0; i < NET_OTA_NONCES; i++) {
+    if (!net_ota_nonces[i].used) continue;
+    if (na_ct_equal_fixed(net_ota_nonces[i].nonce, n.c_str(), 32)) {
+      net_ota_nonces[i].used = false;
+      found = (millis() - net_ota_nonces[i].created) <= 60000UL;
+    }
+  }
+  return found;
+}
 
 static void net_http_reply(WiFiClient& c, int code, const char* text) {
   const char* reason = code == 200 ? "OK" : (code == 401 ? "Unauthorized" : (code == 429 ? "Too Many Requests" : "Error"));
@@ -516,6 +659,10 @@ static void net_ota_draw(int pct, const char* msg) {
 }
 
 static void net_ota_finish_state() {
+  if (net_ota_sha_live) {
+    mbedtls_sha256_free(&net_ota_sha);
+    net_ota_sha_live = false;
+  }
   net_ota_state = OTA_IDLE;
   net_ota_begun = false;
   net_ota_head_len = 0;
@@ -552,24 +699,48 @@ static void net_ota_handle_request_line(const String& line) {
   k.trim();
   v.trim();
   k.toLowerCase();
-  if (k == "x-smartdeck-token") net_ota_token_hdr = v;
+  if (k == "x-smartdeck-nonce") net_ota_nonce_hdr = v;
+  else if (k == "x-smartdeck-sha256") net_ota_sha_hdr = v;
+  else if (k == "x-smartdeck-auth") net_ota_auth_hdr = v;
   else if (k == "content-length") net_ota_len = v.toInt();
 }
 
 static void net_ota_headers_complete() {
+  if (net_ota_path == "/challenge") {  // hand out a fresh single-use nonce
+    if (net_ota_method != "GET") return net_ota_fail(405, "GET only");
+    char n[33];
+    net_ota_issue_nonce(n);
+    net_http_reply(net_ota_client, 200, n);
+    net_ota_finish_state();
+    return;
+  }
   if (net_ota_path != "/update") return net_ota_fail(404, "not found");
   if (net_ota_method != "POST") return net_ota_fail(405, "POST only");
-  bool ok = net_cfg.token.length() >= 8 && net_ct_equal(net_ota_token_hdr, net_cfg.token);
-  net_ota_token_hdr = "";
+
+  // Authenticate BEFORE anything else: nonce (consumed even on failure), well-formed hash, then the HMAC over both.
+  bool nonceOk = net_ota_take_nonce(net_ota_nonce_hdr);
+  bool shaOk = net_ota_sha_hdr.length() == 64 && na_is_hex_lower(net_ota_sha_hdr.c_str(), 64);
+  bool ok = false;
+  if (nonceOk && shaOk) {
+    char exp[65];
+    if (net_hmac_for("ota:", net_ota_nonce_hdr.c_str(), net_ota_sha_hdr.c_str(), exp))
+      ok = na_hmac_matches(net_ota_auth_hdr.c_str(), net_ota_auth_hdr.length(), exp);
+  }
+  net_ota_nonce_hdr = "";
+  net_ota_auth_hdr = "";
   if (!ok) {
-    net_note_auth_fail();
+    net_note_auth_fail(net_ota_ip);
     return net_ota_fail(401, "unauthorized");
   }
-  net_auth_fails = 0;
+  net_note_auth_ok(net_ota_ip);
+
   const esp_partition_t* p = esp_ota_get_next_update_partition(NULL);
   if (!p) return net_ota_fail(500, "no OTA slot");
   if (net_ota_len < 100000L) return net_ota_fail(400, "Content-Length missing or too small");
   if ((size_t)net_ota_len > p->size) return net_ota_fail(413, "image larger than OTA slot");
+  mbedtls_sha256_init(&net_ota_sha);
+  mbedtls_sha256_starts_ret(&net_ota_sha, 0);
+  net_ota_sha_live = true;
   net_ota_state = OTA_BODY;
   net_ota_since = millis();
   net_ota_head_len = 0;
@@ -587,6 +758,7 @@ static void net_ota_body_tick() {
     int n = net_ota_client.read(buf, want);
     if (n <= 0) break;
     net_ota_since = millis();
+    mbedtls_sha256_update_ret(&net_ota_sha, buf, (size_t)n);  // [v4] hash everything we receive, in order
     size_t off = 0;
     if (!net_ota_begun) {  // buffer the first 64 bytes and validate before touching flash
       size_t take = 64 - net_ota_head_len;
@@ -620,7 +792,14 @@ static void net_ota_body_tick() {
   }
 
   if (net_ota_received >= (size_t)net_ota_len) {
-    if (!net_ota_begun || !Update.end() || !Update.isFinished()) return net_ota_fail(500, net_ota_begun ? Update.errorString() : "incomplete");
+    if (!net_ota_begun) return net_ota_fail(500, "incomplete");
+    // [v4] The hash the client signed must equal the hash of what we actually received. Only then is the slot activated.
+    uint8_t dig[32];
+    char got[65];
+    mbedtls_sha256_finish_ret(&net_ota_sha, dig);
+    na_hex(dig, 32, got);
+    if (!na_ct_equal_fixed(got, net_ota_sha_hdr.c_str(), 64)) return net_ota_fail(400, "hash mismatch");  // Update.abort(): old slot stays active
+    if (!Update.end() || !Update.isFinished()) return net_ota_fail(500, Update.errorString());
     net_ota_draw(100, "OTA OK - REBOOTING");
     net_http_reply(net_ota_client, 200, "OK");
     delay(300);
@@ -632,21 +811,29 @@ static void net_ota_body_tick() {
 static void net_ota_tick() {
   if (!net_services_up) {
     if (net_ota_state != OTA_IDLE) {
+      bool wasBody = net_ota_state == OTA_BODY;
       if (net_ota_begun) Update.abort();
       net_ota_client.stop();
       net_ota_finish_state();
+      if (wasBody && !is_sleeping && !is_deep_sleeping) draw_page(current_page);  // WiFi dropped mid-OTA: clear the progress strip
     }
     return;
   }
   WiFiClient nc = net_ota_server.available();
   if (nc) {
-    if (net_ota_state != OTA_IDLE) net_http_reply(nc, 503, "update already in progress");
-    else if (net_locked_out()) net_http_reply(nc, 429, "locked out, retry later");
+    uint32_t ip = (uint32_t)nc.remoteIP();
+    if (net_ota_state == OTA_BODY) net_http_reply(nc, 503, "update already in progress");
+    else if (net_locked_out(ip)) net_http_reply(nc, 429, "locked out, retry later");
     else {
+      if (net_ota_state == OTA_HEADERS) {  // an unauthenticated, still-sending-headers client must not starve a new one: evict it
+        net_ota_client.stop();
+        net_ota_finish_state();
+      }
       net_ota_client = nc;
+      net_ota_ip = ip;
       net_ota_state = OTA_HEADERS;
       net_ota_since = millis();
-      net_ota_method = net_ota_path = net_ota_token_hdr = "";
+      net_ota_method = net_ota_path = net_ota_nonce_hdr = net_ota_sha_hdr = net_ota_auth_hdr = "";
       net_ota_len = -1;
       net_ota_hdr_line = "";
       net_ota_hdr_bytes = 0;
@@ -670,7 +857,10 @@ static void net_ota_tick() {
         net_ota_hdr_line += (char)ch;
       }
     }
-    if (net_ota_state == OTA_HEADERS && (millis() - net_ota_since) > 5000UL) net_ota_fail(408, "header timeout");
+    if (net_ota_state == OTA_HEADERS && (millis() - net_ota_since) > 5000UL) {  // slow/idle before authenticating: counts against that IP
+      net_note_auth_fail(net_ota_ip);
+      net_ota_fail(408, "header timeout");
+    }
     if (net_ota_state == OTA_HEADERS && !net_ota_client.connected() && net_ota_client.available() == 0) net_ota_finish_state();
   }
   if (net_ota_state == OTA_BODY) {
@@ -759,6 +949,7 @@ static void net_action_task(void* param) {
   net_action_page = j->page;
   net_action_idx = j->idx;
   net_action_code = code;
+  __sync_synchronize();  // publish page/idx/code BEFORE the done flag (dual-core: the loop must not see done without them)
   net_action_done = true;
   delete j;
   net_action_busy = false;
@@ -887,6 +1078,7 @@ bool net_button(JsonObject cfg, int page, int idx, bool hasState, bool state) {
 
 static void net_action_result_tick() {
   if (!net_action_done) return;
+  __sync_synchronize();  // pairs with the barrier in the task: read the result only after seeing the flag
   net_action_done = false;
   Serial.printf("[net] action %d:%d -> HTTP %d\n", (int)net_action_page, (int)net_action_idx, (int)net_action_code);  // never log URLs/tokens
 }

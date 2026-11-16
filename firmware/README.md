@@ -113,14 +113,23 @@ Provisioned with `SET_NET:{...}` over USB (or an already-authenticated link); se
 Example: `SET_NET:{"ssid":"MyWifi","pass":"secret-pass","host":"smartdeck","token":"a-long-random-token","tz":"GMT0BST,M3.5.0/1,M10.5.0/2"}`.
 
 - **WiFi** connects asynchronously (retry back-off 1, 2, 4 ... 60 s) and advertises `smartdeck.local` / `_smartdeck._tcp` on port 7778.
-- **Host link**: TCP 7778, first line `AUTH:<token>`. 5 failed attempts lock new connections out for 30 s; unauthenticated clients are dropped after 5 s.
+- **Host link** (v4, mutual HMAC): TCP 7778. The deck sends `CHALLENGE:<32 hex nonce>`; the client answers
+  `AUTH:<hex HMAC-SHA256(token, "client:"+nonce)>`; the deck replies `AUTH_OK:<hex HMAC-SHA256(token, "deck:"+nonce)>` and the client must
+  verify it. The token itself never crosses the network and a sniffed handshake cannot be replayed. Lockout is **per source IP**
+  (5 failures within 60 s => that IP is refused for 30 s; other IPs, e.g. the real Mac, are unaffected). Up to 3 connections may wait to
+  authenticate; a new one evicts the oldest, and idle ones are dropped after 5 s (counted as a failure for that IP). The authenticated link has
+  TCP keepalive (dead peer dropped in ~25 s) and is dropped if it stops draining output.
   `host_io.h` makes the sketch's `Serial` write to USB exactly as before *and* tee to the authenticated client, and read from it while a
   TCP-originated command (e.g. `START_UPLOAD`) is running. NOTE: `#define Serial` is active for every header included after
   `host_io.h` in `smart_deck.ino`; third-party library *headers* with inline `Serial` use should be included before it.
-- **OTA**: `curl -X POST -H "X-SmartDeck-Token: <token>" --data-binary @smart_deck.ino.bin http://smartdeck.local:7779/update`.
-  Send the **app** image (`firmware/dist/parts/smart_deck.ino.bin`), not the merged image; the deck checks the ESP image magic and the
-  app-descriptor magic before writing and rejects anything else (merged image / bootloader / random file).
-  The image is written to the inactive slot (`app0`/`app1`, 3 MB each) and the deck reboots into it.
+- **OTA** (v4, signed by the token holder): `GET http://smartdeck.local:7779/challenge` returns a single-use nonce (valid 60 s). Then
+  `POST /update` with headers `X-SmartDeck-Nonce`, `X-SmartDeck-Sha256` (sha256 of the body) and
+  `X-SmartDeck-Auth: hex HMAC-SHA256(token, "ota:"+nonce+":"+sha256)`. The deck checks nonce + HMAC **before touching flash**, hashes the
+  body while streaming it into the inactive slot, and if the hash differs from the signed one it aborts (`400 hash mismatch`, old slot stays
+  active, no reboot). A sniffed request can't be replayed and the image can't be swapped. `smartdeck-mac ota` does all of this.
+  Send the **app** image (`firmware/dist/parts/smart_deck.ino.bin`), not the merged image; the deck also checks the ESP image magic and the
+  app-descriptor magic and rejects anything else. The image goes to the inactive slot (`app0`/`app1`, 3 MB each) and the deck reboots into it.
+  Remaining limitation: no encryption, so an *active* man-in-the-middle on the LAN can still relay/tamper with post-auth serial-link traffic.
 - **No automatic rollback.** The Arduino-ESP32 2.0.17 precompiled bootloader is built without app rollback. If an OTA image boots but
   crashes or boot-loops, OTA can't help: reflash over USB (`flash` command / esptool, download mode as described above).
   Test new images on the bench before flashing a deck you can't reach.
@@ -180,3 +189,10 @@ BH1750 auto-dim, swipe/hold gestures, WiFi + authenticated TCP host link + OTA +
   draws its configured `label`; set it to `0` for exactly the stock behaviour. A button that has an icon still shows no text unless the
   icon contains it or a live label is set.
 - Unverified on hardware: everything above (drawing, HTTP polling, TLS heap use, queueing of presses behind polls).
+
+### Upload hardening (USB and WiFi `START_UPLOAD`)
+`FILE:<name>:<size>` now requires a name matching `^[A-Za-z0-9._-]{1,48}$` not starting with a dot (else `ERR_CMD_FORMAT`) and a plain positive
+size up to 8 MB (else `ERR_FILE_SIZE`; a negative size can no longer wipe `esp_config.json`). Data goes to `/.upl.tmp`; every write is checked
+(`ERR_WRITE` on a full card/I/O error, the previous file is left untouched), and only a complete upload replaces the real file (old file kept as
+`/.upl.bak` until the rename succeeded). `SET_NET` replies `NET_SET:err:nvs` if flash storage fails and keeps the old settings.
+Known small gap: a power cut in the few milliseconds between the two renames can leave the old file as `/.upl.bak`.

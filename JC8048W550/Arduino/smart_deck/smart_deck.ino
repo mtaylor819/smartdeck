@@ -144,6 +144,7 @@ uint8_t led_brightness = 255;  // LED brightness (0-255)
 
 // [net] Serial tee: lets the WiFi TCP host link share every Serial.* call (host_io.h). Must stay before the first Serial use.
 #include "host_io.h"
+#include "net_auth_logic.h"  // [v4] pure validators/HMAC/lockout (unit-tested on a PC); used by the upload handler and net_wifi.h
 
 // Touch Panel
 TAMC_GT911 tp(TOUCH_SDA, TOUCH_SCL, TOUCH_INT, TOUCH_RST, TOUCH_WIDTH, TOUCH_HEIGHT);
@@ -1205,25 +1206,39 @@ void handleUsbUpload() {
           continue;
         }
 
-        String filename = "/" + cmd.substring(firstColon + 1, secondColon);
-        long fileSize = cmd.substring(secondColon + 1).toInt();
-
-        if (fileSize == 0) {
+        // [v4] strict validation (net_auth_logic.h, unit-tested on a PC): safe filename, 1..8 MB size, digits only.
+        String nameArg = cmd.substring(firstColon + 1, secondColon);
+        String sizeArg = cmd.substring(secondColon + 1);
+        long fileSize = 0;
+        if (!na_filename_ok(nameArg.c_str())) {
+          Serial.println("ERR_CMD_FORMAT");
+          continue;
+        }
+        if (!na_parse_upload_size(sizeArg.c_str(), &fileSize)) {
           Serial.println("ERR_FILE_SIZE");
           continue;
         }
+        String filename = "/" + nameArg;
 
-        if (SD.exists(filename)) {
-          SD.remove(filename);
+        // [v4] not enough room on the card: refuse BEFORE touching anything (the old file stays intact)
+        uint64_t freeBytes = SD.totalBytes() - SD.usedBytes();
+        if (freeBytes < (uint64_t)fileSize + 4096ULL) {
+          Serial.println("ERR_WRITE");
+          continue;
         }
 
-        usbUploadFile = SD.open(filename, FILE_WRITE);
+        // [v4] write to a temp file; the real file is only replaced after every byte was stored
+        const char* TMP_PATH = "/.upl.tmp";
+        const char* BAK_PATH = "/.upl.bak";
+        if (SD.exists(TMP_PATH)) SD.remove(TMP_PATH);
+        usbUploadFile = SD.open(TMP_PATH, FILE_WRITE);
         if (!usbUploadFile) {
           Serial.println("ERR_FILE_CREATE");
         } else {
           Serial.println("OK_FILE");
 
           long remaining = fileSize;
+          bool writeFailed = false;
           unsigned long lastDataTime = millis();
           const unsigned long DATA_TIMEOUT = 10000;  // 10 second timeout
           byte buffer[512];                          // Read in chunks for better performance
@@ -1236,7 +1251,11 @@ void handleUsbUpload() {
               int bytesRead = Serial.readBytes(buffer, toRead);
 
               if (bytesRead > 0) {
-                usbUploadFile.write(buffer, bytesRead);
+                size_t written = usbUploadFile.write(buffer, bytesRead);
+                if (!na_write_complete(written, (size_t)bytesRead)) {  // [v4] SD full / I/O error: never count bytes that were not stored
+                  writeFailed = true;
+                  break;
+                }
                 remaining -= bytesRead;
                 lastDataTime = millis();  // Reset timeout
               }
@@ -1251,9 +1270,28 @@ void handleUsbUpload() {
           }
 
           usbUploadFile.close();
-          if (remaining == 0) {
-            Serial.println("OK_DATA");
+          if (writeFailed) {
+            SD.remove(TMP_PATH);
+            Serial.println("ERR_WRITE");
+          } else if (remaining == 0) {
+            // Replace atomically-ish: keep the old file as a backup until the new one is in place.
+            bool hadOld = SD.exists(filename);
+            bool ok = true;
+            if (hadOld) {
+              if (SD.exists(BAK_PATH)) SD.remove(BAK_PATH);
+              ok = SD.rename(filename, BAK_PATH);
+            }
+            if (ok) ok = SD.rename(TMP_PATH, filename);
+            if (ok) {
+              if (hadOld) SD.remove(BAK_PATH);
+              Serial.println("OK_DATA");
+            } else {
+              if (hadOld && SD.exists(BAK_PATH) && !SD.exists(filename)) SD.rename(BAK_PATH, filename);  // restore the previous file
+              SD.remove(TMP_PATH);
+              Serial.println("ERR_WRITE");
+            }
           } else {
+            SD.remove(TMP_PATH);  // timeout / incomplete: the previous file is untouched
             Serial.printf("ERR_DATA_INCOMPLETE:%ld\n", remaining);
           }
         }
