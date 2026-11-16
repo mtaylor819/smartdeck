@@ -166,6 +166,16 @@ static void net_emit_status() {
   d["ble"] = ble_state_str();
   d["ble_peer"] = ble_peer_str();
   d["fw"] = NET_FW_VERSION;
+  JsonArray caps = d["caps"].to<JsonArray>();  // features the host may rely on (older firmware omits "caps")
+  caps.add("btn_live");
+  caps.add("ha_state");
+  caps.add("ble_hosts");
+  d["ble_slot"] = ble_slot_num();
+  {
+    JsonDocument sl;
+    if (!deserializeJson(sl, ble_slots_json()) && sl.is<JsonArray>()) d["ble_slots"] = sl.as<JsonArray>();
+    else d["ble_slots"].to<JsonArray>();
+  }
   String out;
   serializeJson(d, out);
   Serial.print("NET_STATUS:");
@@ -717,6 +727,12 @@ static volatile bool net_action_busy = false;
 static volatile bool net_action_done = false;
 static volatile int net_action_code = 0;
 static volatile int net_action_page = 0, net_action_idx = 0;
+// [live] The on-deck HA state poller (below) uses its own task but must never run at the same time as a button action
+// (two TLS sessions would stress the heap). A button press that arrives while a poll is in flight is parked here and
+// started as soon as the poll finishes; presses always win over polls.
+static volatile bool live_ha_busy = false;
+static NetActionJob* net_pending = nullptr;
+static void live_ha_note_press(int page, int idx);  // defined with the HA poller below
 
 static void net_action_task(void* param) {
   NetActionJob* j = (NetActionJob*)param;
@@ -750,6 +766,11 @@ static void net_action_task(void* param) {
 }
 
 static bool net_start_action(NetActionJob* j) {
+  if (live_ha_busy && !net_action_busy) {  // [live] a state poll is running: park this press, it starts right after
+    if (net_pending) delete net_pending;
+    net_pending = j;
+    return true;
+  }
   if (net_action_busy) {
     delete j;
     Serial.println("[net] standalone action dropped: previous one still running");
@@ -829,6 +850,7 @@ bool net_button(JsonObject cfg, int page, int idx, bool hasState, bool state) {
     j->method = "POST";
     j->headers.push_back({"Authorization", String("Bearer ") + net_cfg.haToken});
     j->headers.push_back({"Content-Type", "application/json"});
+    live_ha_note_press(page, idx);  // [live] re-read this button's entity state ~700 ms after the service call
     return net_start_action(j);
   }
 
@@ -870,6 +892,200 @@ static void net_action_result_tick() {
 }
 
 // ---------------------------------------------------------------------------------------------------------------
+// On-deck Home Assistant state ("ha_state" on a button) -- standalone wall-panel use. See PROTOCOL.md "v3 additions".
+// Polls GET <ha_url>/api/states/<entity> for the ha_state buttons of the CURRENT page and shows the result through the
+// RAM-only live table (live_table.h), so nothing is ever written to the SD card.
+// Runs only when: WiFi up, HA configured, deck awake, standalone != never, and (no host present OR standalone == always).
+// ---------------------------------------------------------------------------------------------------------------
+#define LIVE_HA_MAX 8
+#define LIVE_HA_DEFAULT_S 10
+#define LIVE_HA_MIN_S 5
+#define LIVE_HA_REPOLL_MS 700UL
+#define LIVE_HA_GAP_MS 250UL  // minimum spacing between two polls (sequential, never hammering HA)
+
+struct LiveHaEntry {
+  bool used;
+  uint8_t idx;
+  uint32_t intervalMs;
+  unsigned long nextDue;
+  char entity[65];
+  LiveHaCfg cfg;
+};
+static LiveHaEntry live_ha[LIVE_HA_MAX];
+static int live_ha_page = -1;
+static unsigned long live_ha_rescan_at = 0;
+static unsigned long live_ha_gap_until = 0;
+
+// Result handed from the poll task to the main loop (the task only writes these, then sets live_ha_done last).
+static volatile bool live_ha_done = false;
+static volatile int live_ha_res_page = 0, live_ha_res_idx = 0, live_ha_res_code = 0;
+static char live_ha_res_state[32];
+
+struct LiveHaJob {
+  String url, token;
+  int page, idx;
+};
+
+static bool live_ha_gate() {
+  if (net_state != NET_CONNECTED) return false;
+  if (net_cfg.standalone == 2) return false;  // "never" disables all on-deck HA work
+  if (net_cfg.haUrl.length() == 0 || net_cfg.haToken.length() == 0) return false;
+  if (is_sleeping || is_deep_sleeping) return false;
+  return !host_link_active() || net_cfg.standalone == 1;
+}
+
+// Rebuild the poll list for the current page from the button JSON (cheap: <= 64 buttons, at most every 3 s / page change).
+static void live_ha_scan(unsigned long now) {
+  LiveHaEntry fresh[LIVE_HA_MAX];
+  memset(fresh, 0, sizeof(fresh));
+  int n = 0;
+  JsonArray btns = doc["pages"][current_page]["buttons"];
+  int total = btns.isNull() ? 0 : (int)btns.size();
+  for (int i = 0; i < total && i < 64 && n < LIVE_HA_MAX; i++) {
+    JsonObject hs = btns[i]["ha_state"];
+    if (hs.isNull()) continue;
+    const char* entity = hs["entity"] | "";
+    if (!live_entity_ok(entity)) continue;
+    LiveHaEntry& e = fresh[n];
+    e.used = true;
+    e.idx = (uint8_t)i;
+    strncpy(e.entity, entity, sizeof(e.entity) - 1);
+    int iv = hs["interval"].is<int>() ? hs["interval"].as<int>() : LIVE_HA_DEFAULT_S;
+    if (iv < LIVE_HA_MIN_S) iv = LIVE_HA_MIN_S;
+    if (iv > 3600) iv = 3600;
+    e.intervalMs = (uint32_t)iv * 1000UL;
+    uint16_t c;
+    if (hs["on"].is<const char*>() && live_hex6(hs["on"].as<const char*>(), &c)) { e.cfg.on565 = c; e.cfg.has |= LIVE_HA_H_ON; }
+    if (hs["off"].is<const char*>() && live_hex6(hs["off"].as<const char*>(), &c)) { e.cfg.off565 = c; e.cfg.has |= LIVE_HA_H_OFF; }
+    if (hs["label_on"].is<const char*>()) { live_sanitize_label(hs["label_on"].as<const char*>(), e.cfg.label_on, LIVE_LABEL_MAX); e.cfg.has |= LIVE_HA_H_LABEL_ON; }
+    if (hs["label_off"].is<const char*>()) { live_sanitize_label(hs["label_off"].as<const char*>(), e.cfg.label_off, LIVE_LABEL_MAX); e.cfg.has |= LIVE_HA_H_LABEL_OFF; }
+    e.nextDue = now;  // new entries poll immediately; existing ones keep their schedule (below)
+    for (int k = 0; k < LIVE_HA_MAX; k++)
+      if (live_ha_page == current_page && live_ha[k].used && live_ha[k].idx == e.idx && strcmp(live_ha[k].entity, e.entity) == 0) {
+        e.nextDue = live_ha[k].nextDue;
+        break;
+      }
+    n++;
+  }
+  memcpy(live_ha, fresh, sizeof(live_ha));
+  live_ha_page = current_page;
+  live_ha_rescan_at = now + 3000UL;
+}
+
+// Called from net_button() right after an `ha` button fires its service call: refresh that button's state soon.
+static void live_ha_note_press(int page, int idx) {
+  if (page != live_ha_page) return;
+  for (int k = 0; k < LIVE_HA_MAX; k++)
+    if (live_ha[k].used && live_ha[k].idx == idx) live_ha[k].nextDue = millis() + LIVE_HA_REPOLL_MS;
+}
+
+static void live_ha_task(void* param) {
+  LiveHaJob* j = (LiveHaJob*)param;
+  int code = -1;
+  char state[32];
+  state[0] = '\0';
+  {
+    HTTPClient http;
+    WiFiClientSecure secure;
+    WiFiClient plain;
+    bool began;
+    if (j->url.startsWith("https://")) {
+      secure.setInsecure();  // same documented trade-off as the HA service call
+      began = http.begin(secure, j->url);
+    } else {
+      began = http.begin(plain, j->url);
+    }
+    if (began) {
+      http.setConnectTimeout(3000);
+      http.setTimeout(3000);
+      http.addHeader("Authorization", String("Bearer ") + j->token);
+      http.addHeader("Accept", "application/json");
+      code = http.GET();
+      if (code == 200) {
+        JsonDocument filter;
+        filter["state"] = true;  // the response also carries all attributes (can be many KB): keep only "state"
+        JsonDocument d;
+        DeserializationError err;
+        int sz = http.getSize();
+        if (sz > 0 && sz <= 65536) {
+          err = deserializeJson(d, http.getStream(), DeserializationOption::Filter(filter));
+        } else if (sz < 0) {  // chunked: let HTTPClient de-chunk (rare for HA)
+          String body = http.getString();
+          err = body.length() <= 65536 ? deserializeJson(d, body, DeserializationOption::Filter(filter)) : DeserializationError::NoMemory;
+        } else {
+          err = DeserializationError::NoMemory;
+        }
+        if (!err && d["state"].is<const char*>()) strncpy(state, d["state"].as<const char*>(), sizeof(state) - 1);
+        else code = -2;
+        state[sizeof(state) - 1] = '\0';
+      }
+      http.end();
+    }
+  }
+  strncpy(live_ha_res_state, state, sizeof(live_ha_res_state));
+  live_ha_res_page = j->page;
+  live_ha_res_idx = j->idx;
+  live_ha_res_code = code;
+  delete j;
+  __sync_synchronize();  // publish the result fields before the flag
+  live_ha_done = true;
+  vTaskDelete(NULL);
+}
+
+static void live_ha_tick() {
+  unsigned long now = millis();
+
+  // 1. consume a finished poll
+  if (live_ha_done) {
+    live_ha_done = false;
+    int page = live_ha_res_page, idx = live_ha_res_idx;
+    for (int k = 0; k < LIVE_HA_MAX; k++) {
+      if (!live_ha[k].used || live_ha[k].idx != idx || page != live_ha_page) continue;
+      LiveUpdate u;
+      live_ha_map(live_ha_res_code == 200 ? live_ha_res_state : "", live_ha[k].cfg, &u);
+      if (live_commit(page, idx, u)) live_redraw(page, idx);
+      live_ha[k].nextDue = now + live_ha[k].intervalMs;
+      break;
+    }
+    live_ha_gap_until = now + LIVE_HA_GAP_MS;
+    live_ha_busy = false;
+  }
+
+  // 2. a press parked while a poll was running goes first
+  if (net_pending && !live_ha_busy && !net_action_busy) {
+    NetActionJob* j = net_pending;
+    net_pending = nullptr;
+    net_start_action(j);
+    return;
+  }
+
+  // 3. maybe start the next poll
+  if (live_ha_busy || net_action_busy || net_pending || (long)(now - live_ha_gap_until) < 0) return;
+  if (!live_ha_gate()) return;
+  if (live_ha_page != current_page || (long)(now - live_ha_rescan_at) >= 0) live_ha_scan(now);
+  int best = -1;
+  for (int k = 0; k < LIVE_HA_MAX; k++) {
+    if (!live_ha[k].used || (long)(now - live_ha[k].nextDue) < 0) continue;
+    if (best < 0 || (long)(live_ha[k].nextDue - live_ha[best].nextDue) < 0) best = k;
+  }
+  if (best < 0) return;
+  String base = net_cfg.haUrl;
+  while (base.endsWith("/")) base.remove(base.length() - 1);
+  LiveHaJob* j = new LiveHaJob();
+  j->url = base + "/api/states/" + String(live_ha[best].entity);
+  j->token = net_cfg.haToken;
+  j->page = current_page;
+  j->idx = live_ha[best].idx;
+  live_ha[best].nextDue = now + live_ha[best].intervalMs;  // reschedule now so a task failure cannot spin
+  live_ha_busy = true;
+  if (xTaskCreatePinnedToCore(live_ha_task, "live_ha", 16384, j, 1, NULL, 0) != pdPASS) {
+    live_ha_busy = false;
+    delete j;
+    Serial.println("[net] HA state poll: task create failed");
+  }
+}
+
+// ---------------------------------------------------------------------------------------------------------------
 // Module entry points
 // ---------------------------------------------------------------------------------------------------------------
 void net_setup() {
@@ -883,6 +1099,7 @@ void net_loop() {
   net_ota_tick();
   net_ntp_tick();
   net_action_result_tick();
+  live_ha_tick();
   Serial.flushTcp();
   if (net_apply_at == 0 && net_status_dirty && (millis() - net_last_status_ms) >= 2000UL) net_emit_status();
 }

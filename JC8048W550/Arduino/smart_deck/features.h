@@ -10,6 +10,7 @@ unsigned long last_host_seen_ms = 0;
 inline void host_seen() { last_host_seen_ms = millis(); }
 inline bool host_link_active() { return last_host_seen_ms != 0 && (millis() - last_host_seen_ms) < 15000UL; }
 
+#include "live_buttons.h"   // [live] SET_BTN_LIVE (RAM-only button overrides); data lives in live_table.h
 #include "net_wifi.h"
 #include "ble_hid.h"
 #include "led_alert.h"
@@ -30,7 +31,7 @@ bool features_command(const String& c) {
   if (c.length() == 0) return false;
   host_seen();                       // any host traffic proves a host is there
   if (c == "HB") return true;        // heartbeat: silent, must NOT wake the deck or reply
-  return net_command(c) || ble_command(c) || alert_command(c) || ambient_command(c) || gestures_command(c) || anim_command(c);
+  return live_command(c) || net_command(c) || ble_command(c) || alert_command(c) || ambient_command(c) || gestures_command(c) || anim_command(c);
 }
 
 // Run a button on the deck itself (called when no host is connected). Returns true if something executed.

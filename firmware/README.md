@@ -163,3 +163,20 @@ BH1750 auto-dim, swipe/hold gestures, WiFi + authenticated TCP host link + OTA +
   list and pair it again on its slot. A random address is only used on slots 2 and 3, so a host that previously paired with slot
   1's public address keeps working untouched.
 - Unit test for the pure logic: `g++ -std=c++17 -Wall -iquote JC8048W550/Arduino/smart_deck firmware/tests/ble_slots_test.cpp -o /tmp/t && /tmp/t`
+## Live buttons and on-deck Home Assistant state (`live_table.h`, `live_buttons.h`, `net_wifi.h`)
+
+- **`SET_BTN_LIVE:<page>:<idx>:<json>`** changes how one button is *drawn* (`label`, `labelColor`, `btnColor`, `labelSize`, `icon`)
+  in RAM only: no SD write (unlike `SET_BTN_DATA`), no wake, no reply. Values live in a fixed 24-entry static table
+  (`live_table.h`, 2 KB, oldest evicted), never in the ArduinoJson document, so heap use is constant however many updates
+  arrive and nothing is ever persisted. Overrides survive page changes and wake; a reboot drops them (the host re-sends).
+  `NET_STATUS` now carries `"caps":["btn_live","ha_state","ble_hosts"]`, `ble_slot` and `ble_slots`.
+- **`ha_state`** on a button (`{"entity":"light.desk","on":"1a8f3c","off":"333333","label_on":"ON","label_off":"OFF","interval":10}`):
+  when WiFi is up, Home Assistant is provisioned (`ha_url`/`ha_token`), the deck is awake, `standalone` is not `never`, and no host is
+  present (or `standalone` is `always`), the deck polls `GET /api/states/<entity>` for ha_state buttons on the current page (<= 8,
+  every `interval` s, min 5, default 10, one at a time, 3 s timeouts) and shows `on`/`off` (anything else, or an error: dim grey and `?`).
+  After an `ha` button press the entity is re-read after ~700 ms. A press that arrives while a poll is running is queued and runs next.
+- **Labels:** the stock firmware draws *no* label text for normal buttons (the Windows app bakes it into the icon JPG). A live label always
+  draws (fitted: font shrinks, then characters trim). With `LIVE_LABEL_FALLBACK 1` (default, `live_table.h`) a button with **no icon** also
+  draws its configured `label`; set it to `0` for exactly the stock behaviour. A button that has an icon still shows no text unless the
+  icon contains it or a live label is set.
+- Unverified on hardware: everything above (drawing, HTTP polling, TLS heap use, queueing of presses behind polls).
