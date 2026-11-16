@@ -92,3 +92,42 @@ Text lines, `\n` terminated, same on every link (USB serial 115200, WiFi TCP). B
 - `NET_STATUS` gains `"ble_slot":<1..3>` and `"ble_slots":["Mac",...]`.
 - Button JSON `"type":"blehost","slot":1|2|3|"next"` is DEVICE-LOCAL: it runs on the deck every time, even when a host is connected
   (like `goto`); it is never sent to the host as BTN.
+
+# v4: security hardening (REPLACES the v2 `AUTH:<token>` handshake and the OTA token header)
+
+The link token is never sent over the network any more. Both sides prove knowledge of it with HMAC-SHA256 over fresh nonces, and the
+deck is authenticated to the host too (an impostor on the LAN cannot capture the token or be mistaken for the deck).
+Notation: `hex(x)` = lowercase hex; `HMAC(k, m)` = HMAC-SHA256 with key = the token's UTF-8 bytes, message = the ASCII bytes of `m`.
+
+## TCP host link (port 7778)
+1. On accept, the deck sends `CHALLENGE:<nonce>` where nonce = 32 lowercase hex chars from the hardware RNG (esp_random x4), fresh per connection.
+2. Client replies `AUTH:<hex(HMAC(token, "client:" + nonce))>` (64 hex chars).
+3. Deck verifies (constant-time compare of the two 64-char strings; always compare the full length). On success it replies
+   `AUTH_OK:<hex(HMAC(token, "deck:" + nonce))>`; the client MUST verify this and drop the link if it does not match. On failure: `AUTH_FAIL`, close.
+4. The rest of the stream is the normal protocol. Unauthenticated peers get only the CHALLENGE line; anything else before a valid AUTH counts as a failure.
+- Lockout is PER SOURCE IP (table of >= 8 recent IPs, LRU): 5 failures from one IP within the window => that IP is refused for 30 s. Other IPs are unaffected
+  (so a hostile device cannot lock out the real Mac). A successful AUTH clears that IP's counter.
+- Pending (unauthenticated) connections must not starve real clients: allow up to 3 pending; a new connection evicts the OLDEST pending one. Pending timeout stays 5 s.
+- Enable TCP keepalive on the authenticated client and drop dead peers within ~30 s.
+
+## OTA (port 7779)
+- `GET /challenge` -> `200` body = a fresh 32-hex nonce (single use, valid 60 s; at most 4 outstanding, oldest evicted). Counts toward per-IP rate limiting.
+- `POST /update` headers: `X-SmartDeck-Nonce: <nonce>`, `X-SmartDeck-Sha256: <hex sha256 of the body>`, `X-SmartDeck-Auth: <hex(HMAC(token, "ota:" + nonce + ":" + sha256hex))>`, `Content-Length`.
+  The deck verifies the nonce (consumes it), then the auth HMAC BEFORE touching flash, then streams the body into the inactive OTA slot while computing SHA-256
+  (mbedtls). At the end it compares the computed hash with the header hash; mismatch => `Update.abort()`, respond `400 hash mismatch`, no reboot. Only then `Update.end(true)` and reboot.
+  Existing checks stay (ESP magic 0xE9, app descriptor, size vs slot, one update at a time, per-IP lockout on bad auth).
+- A sniffed request cannot be replayed (nonce is single use) and the image cannot be swapped (the HMAC covers its hash).
+- Known remaining limitation: no encryption, and an ACTIVE man-in-the-middle on the LAN can still relay/tamper with post-auth traffic. Documented, accepted for a home LAN.
+
+## Upload hardening (both links)
+- `FILE:<name>:<size>`: name must match `^[A-Za-z0-9._-]{1,48}$` and not start with a dot (reject otherwise: `ERR_CMD_FORMAT`); size must be a positive integer <= 8 MB (else `ERR_FILE_SIZE`).
+  Write to a temporary file (`/.upl.tmp`), CHECK the byte count of every write, and only on success remove the old file and rename the temp into place. On any failure
+  delete the temp file and leave the previous file untouched; reply `ERR_WRITE` for write failures (new) in place of OK_DATA.
+
+## BLE pairing safety
+- No new bonds outside a PAIRING WINDOW. The window opens: (a) automatically for 120 s the first time BLE is enabled while no bonds exist; (b) on `BLE_PAIR:<seconds>` (1..300; reply `BLE_PAIR:<n>`);
+  (c) via a device-local button `{"type":"blepair"}` (runs on the deck like `blehost`). Show a small on-screen indicator while open. Outside a window only already-bonded peers may connect
+  (use the NimBLE whitelist / reject unknown peers).
+- HID input reports are only ever sent over an ENCRYPTED, bonded link. An unauthenticated peer that connects and subscribes must receive nothing, and is disconnected after ~15 s.
+  A stranger must not be able to hold the single connection and block the real host.
+- Report map: keyboard usages up to 0xE7 so F13-F24 work (hosts must re-pair after the descriptor change: say so in the README).
