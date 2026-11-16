@@ -1,5 +1,6 @@
 import type { Action } from './actions.js';
 import type { Config } from './config.js';
+import type { NetStatus } from './protocol.js';
 
 export interface DeckStatus {
   connected: boolean;
@@ -11,6 +12,12 @@ export interface DeckStatus {
   log: string[];
   /** latest widget values keyed "page:index" */
   widgets: Record<string, string>;
+  /** How the deck is connected right now. */
+  link?: 'usb' | 'wifi';
+  /** Latest WiFi/BLE state reported by the deck (no secrets). */
+  net?: NetStatus;
+  /** Latest ambient-light reading (lux), if the deck has a sensor. */
+  lux?: number;
 }
 
 /**
@@ -31,4 +38,8 @@ export interface DaemonApi {
   iconsDir(): string;
   /** Called after the UI adds/removes an icon file. */
   iconsChanged(): void;
+  /** Trigger an LED-ring alert on the deck ('off' clears). Optional so older fakes still satisfy the interface. */
+  alert?(kind: 'red' | 'yellow' | 'blue' | 'green' | 'off', seconds: number, text: string): Promise<void>;
+  /** Re-send WiFi/BLE/standalone provisioning to the deck (secrets only go over USB). */
+  provision?(): Promise<void>;
 }

@@ -29,6 +29,8 @@ export interface Widget {
 
 export interface Button extends ButtonStyle {
   action: Action;
+  /** Optional second action run on a long press (the deck then sends BTN_HOLD instead of BTN). */
+  hold?: Action;
   widget?: Widget;
 }
 
@@ -58,10 +60,30 @@ export interface Config {
     homeassistant?: { url: string; token?: string; tokenEnv?: string };
   };
   ui?: { port?: number };
+  /** The deck itself: how to reach it over WiFi, and what it should do on its own (WiFi/BLE/standalone). */
+  device?: DeviceConfig;
+  /** Host-side day/night brightness (applied by the daemon each minute). Overnight ranges (22:00-07:00) work. */
+  brightnessSchedule?: Array<{ from: string; to: string; brightness: number }>;
   /** Which screen the deck shows while asleep. 'diag' = starship-style system diagnostics (needs the updated firmware). */
-  sleepScreen?: 'clock' | 'diag';
+  sleepScreen?: 'clock' | 'diag' | 'diag-anim' | 'warp';
   /** Mac-side audio feedback. press/error are a built-in name (chirp|confirm|error|blip), an absolute file path, or 'none'. */
   sounds?: { press?: string; error?: string; volume?: number };
+}
+
+export interface DeviceConfig {
+  /** WiFi address of the deck, e.g. "smartdeck.local" or "192.168.1.50" (TCP 7778). Used when no USB deck is found. */
+  address?: string;
+  /** Shared secret for the WiFi link and OTA. 8-64 chars. */
+  token?: string;
+  host?: string; // mDNS name the deck advertises (default "smartdeck")
+  wifi?: { ssid: string; password?: string };
+  tz?: string; // POSIX TZ, e.g. "GMT0BST,M3.5.0/1,M10.5.0/2"
+  standalone?: 'auto' | 'always' | 'never';
+  ble?: { enabled: boolean; name?: string };
+  /** Home Assistant the *deck* talks to directly when standalone. */
+  ha?: { url: string; token?: string };
+  autodim?: { enabled: boolean; min: number; max: number; luxLow?: number; luxHigh?: number };
+  gestures?: { swipe: boolean; holdMs?: number };
 }
 
 export const defaultConfig = (): Config => ({
@@ -128,8 +150,21 @@ export function validate(c: Config): Config {
       throw new Error(`page ${i} has ${p.buttons.length} buttons but the grid only has ${cells} cells`);
   });
   if (!(c.knob.step > 0)) throw new Error('knob.step must be > 0');
-  if (c.sleepScreen !== undefined && c.sleepScreen !== 'clock' && c.sleepScreen !== 'diag')
-    throw new Error("sleepScreen must be 'clock' or 'diag'");
+  if (c.sleepScreen !== undefined && !['clock', 'diag', 'diag-anim', 'warp'].includes(c.sleepScreen))
+    throw new Error("sleepScreen must be 'clock', 'diag', 'diag-anim' or 'warp'");
+  const d = c.device;
+  if (d) {
+    if (d.token !== undefined && !/^[\x21-\x7e]{8,64}$/.test(d.token)) throw new Error('device.token must be 8-64 printable characters');
+    if (d.host !== undefined && !/^[a-z0-9-]{1,32}$/.test(d.host)) throw new Error('device.host must be lowercase letters, digits or dashes');
+    if (d.address !== undefined && !/^[A-Za-z0-9._-]{1,253}(:\d{1,5})?$/.test(d.address)) throw new Error('device.address must be a hostname or IP (optional :port)');
+    if (d.standalone !== undefined && !['auto', 'always', 'never'].includes(d.standalone)) throw new Error('device.standalone must be auto, always or never');
+    if (d.ble?.name !== undefined && !/^[\x20-\x7e]{1,24}$/.test(d.ble.name)) throw new Error('device.ble.name must be 1-24 printable characters');
+    if (d.autodim && !(d.autodim.min >= 0 && d.autodim.max <= 100 && d.autodim.min <= d.autodim.max)) throw new Error('device.autodim needs 0 <= min <= max <= 100');
+  }
+  for (const r of c.brightnessSchedule ?? []) {
+    if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(r.from) || !/^([01]\d|2[0-3]):[0-5]\d$/.test(r.to)) throw new Error('brightnessSchedule times must be HH:MM');
+    if (!(r.brightness >= 0 && r.brightness <= 100)) throw new Error('brightnessSchedule brightness must be 0-100');
+  }
   const v = c.sounds?.volume;
   if (v !== undefined && !(v >= 0 && v <= 100)) throw new Error('sounds.volume must be 0-100');
   return c;
@@ -149,6 +184,7 @@ export function toDeviceButton(b: Button | null): Record<string, unknown> | null
   if (b.labelColor !== undefined) out.labelColor = b.labelColor;
   if (b.btnColor !== undefined) out.btnColor = b.btnColor;
   if (b.icon !== undefined) out.icon = b.icon;
+  if (b.hold) out.hold = true;
   const a = b.action;
   out.type = a.type;
   switch (a.type) {
@@ -161,7 +197,9 @@ export function toDeviceButton(b: Button | null): Record<string, unknown> | null
       out.counterAction = a.counterAction ?? 'increment';
       break;
     case 'toggle': if (a.onColor) out.toggleData = { onColor: a.onColor }; break;
-    case 'http': out.http = { url: a.url }; break;
+    case 'http': out.http = { url: a.url, ...(a.method ? { method: a.method } : {}), ...(a.body ? { body: a.body } : {}), ...(a.headers ? { headers: a.headers } : {}) }; break;
+    case 'media': out.media = a.key; break;
+    case 'ha': out.ha = { service: a.service, ...(a.entity ? { entity: a.entity } : {}), ...(a.data ? { data: a.data } : {}) }; break;
   }
   return out;
 }

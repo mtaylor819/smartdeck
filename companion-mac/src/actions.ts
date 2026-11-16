@@ -25,6 +25,7 @@ export type Action =
   | { type: 'urlscheme'; url: string }
   | { type: 'paste'; text: string }
   | { type: 'ha'; service: string; entity?: string; data?: Record<string, unknown> }
+  | { type: 'alert'; kind: 'red' | 'yellow' | 'blue' | 'green' | 'off'; seconds?: number; text?: string }
   | { type: 'none' };
 
 export type MediaKey =
@@ -119,6 +120,7 @@ export class ActionExecutor {
     private fetchImpl: typeof fetch = fetch,
     private sleep: (ms: number) => Promise<void> = (ms) => new Promise((r) => setTimeout(r, ms)),
     private ha: () => HaSettings | undefined = () => undefined,
+    private alert: (a: Extract<Action, { type: 'alert' }>) => Promise<void> = async () => {},
   ) {}
 
   /** Execute an action. `toggleState` is the state the deck reports for toggle buttons. */
@@ -173,6 +175,8 @@ export class ActionExecutor {
         );
       case 'ha':
         return this.callHomeAssistant(action);
+      case 'alert':
+        return this.alert(action);
       case 'delay':
         return this.sleep(action.ms);
       case 'multi':

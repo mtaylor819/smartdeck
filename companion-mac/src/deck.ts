@@ -1,7 +1,7 @@
 import { EventEmitter } from 'node:events';
 import { ActionExecutor } from './actions.js';
 import { Config, findButton, toDeviceConfig } from './config.js';
-import { cmd, DeviceEvent, knobDelta, parseLine } from './protocol.js';
+import { cmd, DeviceEvent, knobDelta, NetStatus, parseLine } from './protocol.js';
 import type { Transport } from './transport.js';
 
 export interface UploadFile {
@@ -20,6 +20,10 @@ export class Deck extends EventEmitter {
   private page = 0;
   private waiters = new Set<(line: string) => boolean>();
   private getConfig: () => Config;
+  private hbTimer?: NodeJS.Timeout;
+  /** Last NET_STATUS the deck reported (WiFi/BLE state). */
+  net: NetStatus = {};
+  lux?: number;
 
   private get config(): Config {
     return this.getConfig();
@@ -36,7 +40,10 @@ export class Deck extends EventEmitter {
     super();
     this.getConfig = typeof cfg === 'function' ? cfg : () => cfg;
     t.on('line', (line: string) => this.onLine(line));
-    t.on('close', () => this.emit('close'));
+    t.on('close', () => {
+      if (this.hbTimer) clearInterval(this.hbTimer);
+      this.emit('close');
+    });
   }
 
   /** Push state the deck needs after connecting. */
@@ -52,6 +59,33 @@ export class Deck extends EventEmitter {
     if (pw?.ledBrightness !== undefined) await this.send(cmd.setLedBrightness(pw.ledBrightness));
     if (this.config.sleepScreen) await this.send(cmd.setSleepScreen(this.config.sleepScreen));
     await this.send(cmd.getSync()); // deck replies with SYNC_PAGE / KNOB_RAW / SYNC_STATE...
+  }
+
+  /**
+   * Tell the deck a host is present (so it reports presses to us instead of acting standalone).
+   * Only call this once the deck has proven it understands the new protocol: the stock firmware treats
+   * any unknown command (including HB) as activity and would never go to sleep.
+   */
+  startHeartbeat(everyMs = 5000): void {
+    if (this.hbTimer) clearInterval(this.hbTimer);
+    this.hbTimer = setInterval(() => void this.send(cmd.hb()).catch(() => {}), everyMs);
+    this.hbTimer.unref?.();
+    void this.send(cmd.hb()).catch(() => {});
+  }
+
+  /** Ask for NET_STATUS. Resolves null if the deck doesn't answer (= firmware without the WiFi/BLE module). */
+  requestNetStatus(timeoutMs = 1500): Promise<NetStatus | null> {
+    return new Promise((resolve) => {
+      const onEv = (ev: DeviceEvent) => {
+        if (ev.type !== 'netStatus') return;
+        clearTimeout(timer);
+        this.off('event', onEv);
+        resolve(ev.status);
+      };
+      const timer = setTimeout(() => { this.off('event', onEv); resolve(null); }, timeoutMs);
+      this.on('event', onEv);
+      this.send(cmd.getNet()).catch(() => { clearTimeout(timer); this.off('event', onEv); resolve(null); });
+    });
   }
 
   send(line: string): Promise<void> {
@@ -83,6 +117,30 @@ export class Deck extends EventEmitter {
         }
         return;
       }
+      case 'hold': {
+        const b = findButton(this.config, ev.page, ev.index);
+        if (!b?.hold) return this.log(`hold ${ev.page}:${ev.index} has no hold action`);
+        this.log(`hold ${ev.page}:${ev.index} ${b.label ?? ''} (${b.hold.type})`);
+        this.feedback('press');
+        try {
+          await this.exec.execute(b.hold);
+        } catch (e) {
+          this.feedback('error');
+          this.log(`hold action failed: ${e instanceof Error ? e.message : e}`);
+        }
+        return;
+      }
+      case 'netStatus':
+        this.net = ev.status;
+        this.emit('event', ev);
+        return;
+      case 'lux':
+        this.lux = ev.value;
+        return;
+      case 'alertAck':
+        this.log(`alert acknowledged on deck (${ev.kind})`);
+        this.emit('event', ev);
+        return;
       case 'knob':
         return this.onKnob(ev.raw);
       case 'page':

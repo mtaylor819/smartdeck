@@ -10,9 +10,20 @@ export type DeviceEvent =
   | { type: 'counter'; page: number; index: number; value: number }
   | { type: 'timer'; page: number; index: number; mode: number; seconds: number }
   | { type: 'timerDone'; page: number; index: number }
+  | { type: 'hold'; page: number; index: number }
+  | { type: 'alertAck'; kind: string }
+  | { type: 'lux'; value: number }
+  | { type: 'netStatus'; status: NetStatus }
   | { type: 'getTime' }
   | { type: 'setupDone' }
   | { type: 'log'; line: string };
+
+/** Deck-reported connectivity state (NET_STATUS). Never contains secrets. */
+export interface NetStatus {
+  wifi?: 'off' | 'connecting' | 'connected';
+  ip?: string; rssi?: number; host?: string; ssid?: string; clients?: number;
+  ota?: boolean; ntp?: boolean; ble?: 'off' | 'advertising' | 'connected'; ble_peer?: string; fw?: string;
+}
 
 const ints = (s: string): number[] => s.split(':').map((n) => parseInt(n, 10));
 
@@ -64,6 +75,24 @@ export function parseLine(raw: string): DeviceEvent {
       if ([page, index].some(Number.isNaN)) break;
       return { type: 'timerDone', page, index };
     }
+    case 'BTN_HOLD': {
+      const [page, index] = ints(rest);
+      if ([page, index].some(Number.isNaN)) break;
+      return { type: 'hold', page, index };
+    }
+    case 'ALERT_ACK':
+      return { type: 'alertAck', kind: rest };
+    case 'LUX': {
+      const [value] = ints(rest);
+      if (Number.isNaN(value)) break;
+      return { type: 'lux', value };
+    }
+    case 'NET_STATUS':
+      try {
+        const status = JSON.parse(rest);
+        if (status && typeof status === 'object') return { type: 'netStatus', status };
+      } catch { /* fall through to log */ }
+      break;
     case 'GET_TIME':
       return { type: 'getTime' };
     case 'SETUP_DONE':
@@ -71,6 +100,8 @@ export function parseLine(raw: string): DeviceEvent {
   }
   return { type: 'log', line };
 }
+
+export type AlertKind = 'red' | 'yellow' | 'blue' | 'green';
 
 const p2 = (n: number) => String(n).padStart(2, '0');
 
@@ -88,11 +119,23 @@ export const cmd = {
   setDeepSleep: (minutes: number) => `SET_DEEP_SLEEP:${Math.max(0, Math.round(minutes))}`,
   setDimLed: (anim: string) => `SET_DIM_LED:${anim}`,
   setLedBrightness: (n: number) => `SET_LED_BRIGHTNESS:${clamp(Math.round(n), 0, 255)}`,
-  setSleepScreen: (mode: 'clock' | 'diag') => `SET_SLEEP_SCREEN:${mode}`,
+  setSleepScreen: (mode: 'clock' | 'diag' | 'diag-anim' | 'warp') => `SET_SLEEP_SCREEN:${mode}`,
   diag: (d: { cpu: number; mem: number; disk: number; rx: number; tx: number; uptimeMin: number; host: string }) =>
     `DIAG:${clamp(Math.round(d.cpu), 0, 100)}:${clamp(Math.round(d.mem), 0, 100)}:${clamp(Math.round(d.disk), 0, 100)}:` +
     `${Math.max(0, Math.round(d.rx))}:${Math.max(0, Math.round(d.tx))}:${Math.max(0, Math.round(d.uptimeMin))}:` +
     d.host.replace(/[^A-Za-z0-9._-]/g, '').slice(0, 16),
+  hb: () => 'HB',
+  getNet: () => 'GET_NET',
+  /** Provisioning blob. Secrets inside: only send over USB (or an authenticated link). */
+  setNet: (o: Record<string, unknown>) => `SET_NET:${JSON.stringify(o)}`,
+  setBle: (o: { enabled: boolean; name?: string }) => `SET_BLE:${JSON.stringify(o)}`,
+  alert: (kind: AlertKind, seconds = 0, text = '') =>
+    `ALERT:${kind}:${clamp(Math.round(seconds), 0, 3600)}` + (text ? `:${text.replace(/[^\x20-\x7e]|:/g, '').slice(0, 24)}` : ''),
+  alertOff: () => 'ALERT:off',
+  setAutodim: (on: boolean, minPct: number, maxPct: number, luxLow?: number, luxHigh?: number) =>
+    `SET_AUTODIM:${on ? 1 : 0}:${clamp(Math.round(minPct), 0, 100)}:${clamp(Math.round(maxPct), 0, 100)}` +
+    (luxLow !== undefined && luxHigh !== undefined ? `:${Math.round(luxLow)}:${Math.round(luxHigh)}` : ''),
+  setGestures: (swipe: boolean, holdMs: number) => `SET_GESTURES:${swipe ? 1 : 0}:${clamp(Math.round(holdMs), 200, 3000)}`,
   setPage: (page: number) => `SET_PAGE:${page}`,
   setKnobLed: (r: number, g: number, b: number, tail: number) =>
     `SET_KNOB:${clamp(r, 0, 255)}:${clamp(g, 0, 255)}:${clamp(b, 0, 255)}:${clamp(tail, 1, 15)}`,

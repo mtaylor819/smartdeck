@@ -73,19 +73,39 @@ async function readJson(req: IncomingMessage): Promise<any> {
   }
 }
 
+/** Config values that are secrets: shown as *** to the browser, and kept when the browser sends *** back. */
+const SECRET_PATHS: string[][] = [
+  ['integrations', 'homeassistant', 'token'],
+  ['device', 'wifi', 'password'],
+  ['device', 'token'],
+  ['device', 'ha', 'token'],
+];
+
+function getPath(o: any, path: string[]): { parent: any; key: string } | null {
+  let cur = o;
+  for (const k of path.slice(0, -1)) {
+    cur = cur?.[k];
+    if (cur === null || typeof cur !== 'object') return null;
+  }
+  return { parent: cur, key: path[path.length - 1] };
+}
+
 function maskConfig(c: Config): Config {
   const copy = JSON.parse(JSON.stringify(c)) as Config;
-  const ha = copy.integrations?.homeassistant;
-  if (ha?.token) ha.token = MASK;
+  for (const p of SECRET_PATHS) {
+    const t = getPath(copy, p);
+    if (t?.parent[t.key]) t.parent[t.key] = MASK;
+  }
   return copy;
 }
 
 function unmaskConfig(next: Config, current: Config): Config {
-  const ha = next.integrations?.homeassistant;
-  if (ha && ha.token === MASK) {
-    const old = current.integrations?.homeassistant?.token;
-    if (old) ha.token = old;
-    else delete ha.token;
+  for (const p of SECRET_PATHS) {
+    const t = getPath(next, p);
+    if (!t || t.parent[t.key] !== MASK) continue;
+    const old = getPath(current, p);
+    if (old?.parent[old.key]) t.parent[t.key] = old.parent[old.key];
+    else delete t.parent[t.key];
   }
   return next;
 }
@@ -175,6 +195,29 @@ export async function startServer(api: DaemonApi, opts: ServerOptions = {}): Pro
             await api.testAction(body.action);
           } catch (e) {
             return json(res, 500, { error: e instanceof Error ? e.message : String(e) });
+          }
+          return json(res, 200, { ok: true });
+        }
+        if (method === 'POST' && path === '/api/alert') {
+          if (!api.alert) return json(res, 501, { error: 'alerts not supported' });
+          const body = await readJson(req);
+          const kinds = ['red', 'yellow', 'blue', 'green', 'off'];
+          if (!body || !kinds.includes(body.kind)) return json(res, 400, { error: 'kind must be red, yellow, blue, green or off' });
+          const seconds = body.seconds === undefined ? 0 : Number(body.seconds);
+          if (!Number.isFinite(seconds) || seconds < 0 || seconds > 3600) return json(res, 400, { error: 'seconds must be 0-3600' });
+          try {
+            await api.alert(body.kind, seconds, typeof body.text === 'string' ? body.text : '');
+          } catch (e) {
+            return json(res, 502, { error: e instanceof Error ? e.message : String(e) });
+          }
+          return json(res, 200, { ok: true });
+        }
+        if (method === 'POST' && path === '/api/provision') {
+          if (!api.provision) return json(res, 501, { error: 'provisioning not supported' });
+          try {
+            await api.provision();
+          } catch (e) {
+            return json(res, 502, { error: e instanceof Error ? e.message : String(e) });
           }
           return json(res, 200, { ok: true });
         }

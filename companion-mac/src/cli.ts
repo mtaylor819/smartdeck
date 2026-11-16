@@ -5,8 +5,25 @@ import { configPath, loadConfig, writeDefaultConfig } from './config.js';
 import { Daemon } from './daemon.js';
 import { flashArgs, runEsptool, verifyChecksum } from './flash.js';
 import { startServer } from './server.js';
+import { otaUpdate } from './ota.js';
 import { installService } from './service.js';
 import { listCandidatePorts } from './transport.js';
+
+/** Talk to the already-running daemon's local API (fetches the page for its per-process CSRF token first). */
+async function daemonPost(path: string, body: unknown): Promise<void> {
+  const base = `http://127.0.0.1:${loadConfig().ui?.port ?? 7777}`;
+  let page: string;
+  try {
+    page = await (await fetch(base + '/')).text();
+  } catch {
+    throw new Error(`Can't reach the SmartDeck daemon at ${base}. Is \`smartdeck-mac run\` running?`);
+  }
+  const token = /name="csrf-token" content="([^"]+)"/.exec(page)?.[1];
+  if (!token) throw new Error('daemon did not provide a token');
+  const res = await fetch(base + path, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-SmartDeck-Token': token }, body: JSON.stringify(body) });
+  const json = (await res.json().catch(() => ({}))) as { error?: string };
+  if (!res.ok) throw new Error(json.error ?? `HTTP ${res.status}`);
+}
 
 async function main() {
   const [command = 'run', ...rest] = process.argv.slice(2);
@@ -55,6 +72,28 @@ async function main() {
       await runEsptool(flashArgs(port, bin));
       return;
     }
+    case 'alert': {
+      // smartdeck-mac alert red [seconds] [text...]   |   smartdeck-mac alert off
+      const [kind, secs, ...text] = rest.filter((a) => a !== '--port');
+      if (!kind) throw new Error('usage: smartdeck-mac alert <red|yellow|blue|green|off> [seconds] [text]');
+      await daemonPost('/api/alert', { kind, seconds: secs === undefined ? 0 : Number(secs), text: text.join(' ') });
+      console.log('alert sent');
+      return;
+    }
+    case 'provision': {
+      await daemonPost('/api/provision', {});
+      console.log('provisioning sent');
+      return;
+    }
+    case 'ota': {
+      // smartdeck-mac ota firmware/dist/parts/smart_deck.ino.bin   (uses device.address + device.token from the config)
+      const bin = rest.find((a) => !a.startsWith('--'));
+      const d = loadConfig().device;
+      if (!bin) throw new Error('usage: smartdeck-mac ota <smart_deck.ino.bin>   (the APP image, not the merged one)');
+      if (!d?.address || !d.token) throw new Error('set device.address and device.token in the config first');
+      await otaUpdate(d.address, d.token, bin, fetch, (m) => console.log(m));
+      return;
+    }
     case 'open': {
       const port = loadConfig().ui?.port ?? 7777;
       execFile('open', [`http://127.0.0.1:${port}/`]);
@@ -66,7 +105,7 @@ async function main() {
       return;
     }
     default:
-      console.log('usage: smartdeck-mac [run|open|init|ports|sync|flash|install-service] [--port /dev/cu.usbmodemXXXX]');
+      console.log('usage: smartdeck-mac [run|open|init|ports|sync|flash|ota|alert|provision|install-service] [--port /dev/cu.usbmodemXXXX]');
       process.exitCode = 1;
   }
 }

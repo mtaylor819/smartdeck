@@ -85,6 +85,19 @@ function trimConfig(cfg) {
   if (out.power && !Object.keys(out.power).length) delete out.power;
   if (!out.weather) delete out.weather;
   if (out.sounds && !Object.keys(out.sounds).length) delete out.sounds;
+  if (out.device) {
+    const prune = (o) => {
+      for (const k of Object.keys(o)) {
+        if (o[k] === '' || o[k] === undefined || o[k] === null) delete o[k];
+        else if (typeof o[k] === 'object' && !Array.isArray(o[k])) { prune(o[k]); if (!Object.keys(o[k]).length) delete o[k]; }
+      }
+    };
+    prune(out.device);
+    if (out.device.wifi && !out.device.wifi.ssid) delete out.device.wifi;
+    if (out.device.ha && !out.device.ha.url) delete out.device.ha;
+    if (!Object.keys(out.device).length) delete out.device;
+  }
+  if (out.brightnessSchedule && !out.brightnessSchedule.length) delete out.brightnessSchedule;
   if (out.appPages) {
     out.appPages = out.appPages.filter((r) => r.app);
     if (!out.appPages.length) delete out.appPages;
@@ -113,6 +126,7 @@ const TYPES = {
   mouse: { label: 'Mouse', def: () => ({ type: 'mouse', op: 'click' }) },
   http: { label: 'HTTP request', def: () => ({ type: 'http', url: 'https://', method: 'GET' }) },
   ha: { label: 'Home Assistant', def: () => ({ type: 'ha', service: 'light.toggle', entity: '' }) },
+  alert: { label: 'LED alert (red alert…)', def: () => ({ type: 'alert', kind: 'red', seconds: 10, text: '' }) },
   multi: { label: 'Multi-action', def: () => ({ type: 'multi', steps: [] }) },
   delay: { label: 'Delay', def: () => ({ type: 'delay', ms: 500 }), stepOnly: true },
   toggle: { label: 'Toggle', def: () => ({ type: 'toggle', on: { type: 'none' }, off: { type: 'none' } }), noNest: true },
@@ -137,6 +151,7 @@ const FIELDS = {
   mouse: [['op', 'Operation', 'select', ['click', 'double', 'right', 'move', 'scroll']], ['x', 'X', 'num'], ['y', 'Y', 'num'], ['dx', 'Scroll dx', 'num'], ['dy', 'Scroll dy', 'num']],
   http: [['url', 'URL', 'text'], ['method', 'Method', 'select', ['GET', 'POST', 'PUT', 'DELETE']], ['body', 'Body', 'area'], ['headers', 'Headers (JSON)', 'json']],
   ha: [['service', 'Service (domain.service)', 'text'], ['entity', 'Entity id', 'text'], ['data', 'Extra data (JSON)', 'json']],
+  alert: [['kind', 'Alert', 'select', ['red', 'yellow', 'blue', 'green', 'off']], ['seconds', 'Seconds (0 = until acked)', 'num'], ['text', 'Banner text', 'text']],
   delay: [['ms', 'Milliseconds', 'num']],
   goto: [['page', 'Page (1-based)', 'num']],
   timer: [['duration', 'Seconds', 'num']],
@@ -372,6 +387,16 @@ function redrawPanel() {
     } }, 'Test action'),
     h('button', { class: 'danger', onclick: () => { btns[state.sel] = null; state.sel = null; markDirty(); drawGrid(); redrawPanel(); } }, 'Clear button')));
 
+  const holdBox = h('div', {});
+  const drawHold = () => {
+    holdBox.replaceChildren(h('h4', {}, 'Long-press action'),
+      row('Enabled', h('input', { type: 'checkbox', checked: !!b.hold, onchange: (e) => { if (e.target.checked) b.hold = { type: 'none' }; else delete b.hold; markDirty(); drawHold(); } })));
+    if (b.hold) holdBox.append(h('div', { class: 'box' }, actionEditor(b, 'hold', markDirty, 'step'),
+      h('div', { class: 'muted' }, 'Needs the updated firmware: holding sends BTN_HOLD instead of a normal press.')));
+  };
+  drawHold();
+  panel.append(holdBox);
+
   panel.append(h('h4', {}, 'Live widget'), widgetEditor(b, changed));
 }
 
@@ -512,8 +537,8 @@ function drawSettings() {
 
   const sleepBox = h('div', {}, h('h3', {}, 'Sleep screen'),
     row('Show', h('select', { onchange: (e) => { if (e.target.value === 'clock') delete c.sleepScreen; else c.sleepScreen = e.target.value; chg(); } },
-      [['clock', 'Clock + weather'], ['diag', 'Starship diagnostics']].map(([v, l]) => h('option', { value: v, selected: (c.sleepScreen || 'clock') === v }, l)))),
-    h('div', { class: 'muted' }, 'Diagnostics needs the updated firmware (firmware/ folder): CPU, memory, storage, network, uptime.'));
+      [['clock', 'Clock + weather'], ['diag', 'Starship diagnostics'], ['diag-anim', 'Diagnostics (animated)'], ['warp', 'Warp speed + clock']].map(([v, l]) => h('option', { value: v, selected: (c.sleepScreen || 'clock') === v }, l)))),
+    h('div', { class: 'muted' }, 'Diagnostics and animated screens need the updated firmware (firmware/ folder).'));
 
   c.weather ||= null;
   const wBox = h('div', {}, h('h3', {}, 'Weather (sleep screen)'));
@@ -545,8 +570,63 @@ function drawSettings() {
     row('…or env var', txt(ha, 'tokenEnv', { placeholder: 'HA_TOKEN' })),
     h('div', { class: 'muted' }, 'A saved token is shown as ***. Leave it to keep the existing token.'));
 
+  // ---- connectivity / deck-side features ----
+  const d = (c.device ||= {});
+  const sub = (key, init) => (d[key] ||= init);
+  const secret = (obj, key, ph) => h('input', { type: 'password', autocomplete: 'off', placeholder: ph || '', value: obj[key] ?? '',
+    oninput: (e) => { if (e.target.value) obj[key] = e.target.value; else delete obj[key]; chg(); } });
+  const tokenInput = h('input', { type: 'password', autocomplete: 'off', value: d.token ?? '', placeholder: '8-64 characters',
+    oninput: (e) => { if (e.target.value) d.token = e.target.value; else delete d.token; chg(); } });
+  const genToken = () => { const a = new Uint8Array(12); crypto.getRandomValues(a); d.token = [...a].map((x) => x.toString(16).padStart(2, '0')).join(''); tokenInput.value = d.token; tokenInput.type = 'text'; chg(); };
+  const connBox = h('div', {}, h('h3', {}, 'Deck connectivity (WiFi / Bluetooth)'),
+    h('div', { class: 'muted' }, 'Needs the updated firmware. WiFi password and tokens are only ever sent over USB, never over the network.'),
+    h('h4', {}, 'WiFi'),
+    row('Network (SSID)', h('input', { type: 'text', value: d.wifi?.ssid ?? '', oninput: (e) => { sub('wifi', { ssid: '' }).ssid = e.target.value; chg(); } })),
+    row('Password', h('input', { type: 'password', autocomplete: 'off', value: d.wifi?.password ?? '', oninput: (e) => { const w = sub('wifi', { ssid: '' }); if (e.target.value) w.password = e.target.value; else delete w.password; chg(); } })),
+    row('Deck address', txt(d, 'address', { placeholder: 'smartdeck.local or 192.168.1.50' })),
+    row('Deck hostname', txt(d, 'host', { placeholder: 'smartdeck' })),
+    row('Link / OTA token', h('div', { class: 'inline' }, tokenInput, h('button', { class: 'small', onclick: genToken }, 'Generate'))),
+    row('Time zone (POSIX)', txt(d, 'tz', { placeholder: 'GMT0BST,M3.5.0/1,M10.5.0/2' })),
+    h('h4', {}, 'Standalone (no Mac needed)'),
+    row('Run on the deck', h('select', { onchange: (e) => { if (e.target.value === 'auto') delete d.standalone; else d.standalone = e.target.value; chg(); } },
+      [['auto', 'Only when no Mac is connected'], ['always', 'Always'], ['never', 'Never']].map(([v2, l]) => h('option', { value: v2, selected: (d.standalone || 'auto') === v2 }, l)))),
+    row('Bluetooth keyboard', h('input', { type: 'checkbox', checked: !!d.ble?.enabled, onchange: (e) => { sub('ble', { enabled: false }).enabled = e.target.checked; chg(); } })),
+    row('Bluetooth name', h('input', { type: 'text', placeholder: 'SmartDeck', value: d.ble?.name ?? '', oninput: (e) => { const b = sub('ble', { enabled: false }); if (e.target.value) b.name = e.target.value; else delete b.name; chg(); } })),
+    row('Home Assistant URL', h('input', { type: 'text', placeholder: 'http://homeassistant.local:8123', value: d.ha?.url ?? '', oninput: (e) => { sub('ha', { url: '' }).url = e.target.value; chg(); } })),
+    row('HA token (deck)', h('input', { type: 'password', autocomplete: 'off', value: d.ha?.token ?? '', oninput: (e) => { const x = sub('ha', { url: '' }); if (e.target.value) x.token = e.target.value; else delete x.token; chg(); } })),
+    h('div', { class: 'inline' }, h('button', { onclick: async () => { try { await api('POST', '/api/provision', {}); toast('Sent to deck'); } catch (e) { toast(e.message, true); } } }, 'Push to deck (USB)')));
+
+  const ad = () => (d.autodim ||= { enabled: false, min: 10, max: 100 });
+  const gest = () => (d.gestures ||= { swipe: true, holdMs: 600 });
+  const deckBox = h('div', {}, h('h3', {}, 'Gestures'),
+    row('Swipe to change page', h('input', { type: 'checkbox', checked: d.gestures?.swipe !== false, onchange: (e) => { gest().swipe = e.target.checked; chg(); } })),
+    row('Hold time (ms)', h('input', { type: 'number', min: 200, max: 3000, placeholder: '600', value: d.gestures?.holdMs ?? '', oninput: (e) => { if (e.target.value === '') delete gest().holdMs; else gest().holdMs = Number(e.target.value); chg(); } })),
+    h('h3', {}, 'Auto-dim (light sensor)'),
+    h('div', { class: 'muted' }, 'Needs a BH1750 light sensor on the deck.'),
+    row('Enabled', h('input', { type: 'checkbox', checked: !!d.autodim?.enabled, onchange: (e) => { ad().enabled = e.target.checked; chg(); } })),
+    row('Dimmest %', h('input', { type: 'number', min: 0, max: 100, value: d.autodim?.min ?? '', placeholder: '10', oninput: (e) => { ad().min = Number(e.target.value || 10); chg(); } })),
+    row('Brightest %', h('input', { type: 'number', min: 0, max: 100, value: d.autodim?.max ?? '', placeholder: '100', oninput: (e) => { ad().max = Number(e.target.value || 100); chg(); } })));
+
+  c.brightnessSchedule ||= [];
+  const schedBox = h('div', {});
+  const drawSched = () => {
+    schedBox.replaceChildren(h('h3', {}, 'Brightness schedule'), h('div', { class: 'muted' }, 'Day/night dimming from the Mac. Windows may cross midnight.'));
+    c.brightnessSchedule.forEach((r, i) => schedBox.append(h('div', { class: 'inline' },
+      h('input', { type: 'time', value: r.from, oninput: (e) => { r.from = e.target.value; chg(); } }),
+      h('input', { type: 'time', value: r.to, oninput: (e) => { r.to = e.target.value; chg(); } }),
+      h('input', { type: 'number', min: 0, max: 100, value: r.brightness, title: 'brightness %', oninput: (e) => { r.brightness = Number(e.target.value); chg(); } }),
+      h('button', { class: 'small danger', onclick: () => { c.brightnessSchedule.splice(i, 1); chg(); drawSched(); } }, '✕'))));
+    schedBox.append(h('button', { class: 'small', onclick: () => { c.brightnessSchedule.push({ from: '22:00', to: '07:00', brightness: 15 }); chg(); drawSched(); } }, '+ Window'));
+  };
+  drawSched();
+
+  const alertBox = h('div', {}, h('h3', {}, 'Alerts (LED ring)'),
+    h('div', { class: 'muted' }, 'Test the ring. Also available as a button action, `smartdeck-mac alert red 30 "text"`, or POST /api/alert.'),
+    h('div', { class: 'inline' }, ['red', 'yellow', 'blue', 'green', 'off'].map((k) => h('button', { class: 'small' + (k === 'red' ? ' danger' : ''),
+      onclick: async () => { try { await api('POST', '/api/alert', { kind: k, seconds: k === 'off' ? 0 : 10, text: k === 'red' ? 'Red alert' : '' }); } catch (e) { toast(e.message, true); } } }, k))));
+
   v.append(h('div', { class: 'inline' }, h('h2', {}, 'Settings'), h('div', { class: 'spacer' }), h('button', { onclick: () => setView('editor') }, '← Back to buttons')),
-    h('div', { class: 'grid2' }, h('div', {}, general, power, sleepBox, soundsBox), h('div', {}, knobBox, wBox, rules, haBox)));
+    h('div', { class: 'grid2' }, h('div', {}, general, power, sleepBox, schedBox, soundsBox), h('div', {}, knobBox, connBox, deckBox, alertBox, wBox, rules, haBox)));
 }
 function clampInt(v, lo, hi) { return Math.min(hi, Math.max(lo, Math.round(Number(v)) || lo)); }
 
@@ -564,7 +644,9 @@ async function pollStatus() {
     const s = await api('GET', '/api/status');
     state.status = s;
     $('conn').className = 'conn ' + (s.connected ? 'on' : 'off');
-    $('connText').textContent = s.connected ? `${s.deviceName || 'Deck'}${s.port ? ' · ' + s.port : ''} · page ${s.page + 1}` : 'Deck not connected';
+    const n = s.net || {};
+    const extra = [s.link === 'wifi' ? 'WiFi' : s.link === 'usb' ? 'USB' : '', n.ble && n.ble !== 'off' ? 'BT ' + n.ble : '', s.lux !== undefined ? s.lux + ' lux' : ''].filter(Boolean).join(' · ');
+    $('connText').textContent = s.connected ? `${s.deviceName || 'Deck'}${extra ? ' · ' + extra : ''} · page ${s.page + 1}` : 'Deck not connected';
     $('logText').textContent = (s.log || []).join('\n');
   } catch {
     $('conn').className = 'conn off';

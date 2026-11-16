@@ -1,4 +1,5 @@
 import { EventEmitter } from 'node:events';
+import net from 'node:net';
 import { SerialPort, ReadlineParser } from 'serialport';
 
 /** What the deck controller needs from a connection. Real = serial; tests use a fake. */
@@ -81,4 +82,74 @@ export async function findDeck(
     }
   }
   return null;
+}
+
+/** Line-based TCP link to a deck over WiFi (or to the virtual deck). First line sent is AUTH:<token>. */
+export class TcpTransport extends EventEmitter implements Transport {
+  private buf = '';
+  private constructor(private sock: net.Socket) {
+    super();
+    sock.setNoDelay(true);
+    sock.setEncoding('utf8');
+    sock.on('data', (chunk: string) => {
+      this.buf += chunk;
+      if (this.buf.length > 64 * 1024) { this.sock.destroy(new Error('line too long')); return; }
+      let i: number;
+      while ((i = this.buf.indexOf('\n')) >= 0) {
+        const line = this.buf.slice(0, i).replace(/\r$/, '');
+        this.buf = this.buf.slice(i + 1);
+        this.emit('line', line);
+      }
+    });
+    sock.on('close', () => this.emit('close'));
+    sock.on('error', (e) => this.emit('error', e));
+  }
+
+  /** Connect and authenticate. Rejects on timeout, refusal or AUTH_FAIL. */
+  static connect(address: string, token: string, timeoutMs = 4000): Promise<TcpTransport> {
+    const m = /^(.+?)(?::(\d{1,5}))?$/.exec(address);
+    if (!m) return Promise.reject(new Error(`bad address: ${address}`));
+    const host = m[1];
+    const port = m[2] ? Number(m[2]) : 7778;
+    return new Promise((resolve, reject) => {
+      const sock = net.connect({ host, port });
+      const fail = (e: Error) => { clearTimeout(timer); sock.destroy(); reject(e); };
+      const timer = setTimeout(() => fail(new Error(`timeout connecting to ${host}:${port}`)), timeoutMs);
+      sock.once('error', fail);
+      sock.once('connect', () => {
+        sock.setEncoding('utf8');
+        let acc = '';
+        const onData = (chunk: string) => {
+          acc += chunk;
+          const nl = acc.indexOf('\n');
+          if (nl < 0) return;
+          sock.off('data', onData);
+          clearTimeout(timer);
+          const reply = acc.slice(0, nl).trim();
+          if (reply !== 'AUTH_OK') return fail(new Error(reply === 'AUTH_FAIL' ? 'deck rejected the token' : `unexpected reply: ${reply.slice(0, 40)}`));
+          sock.off('error', fail);
+          const t = new TcpTransport(sock);
+          // anything after AUTH_OK in the same chunk belongs to the stream
+          const rest = acc.slice(nl + 1);
+          if (rest) setImmediate(() => sock.emit('data', rest));
+          resolve(t);
+        };
+        sock.on('data', onData);
+        sock.write(`AUTH:${token}\n`);
+      });
+    });
+  }
+
+  write(data: string | Buffer): Promise<void> {
+    return new Promise((resolve, reject) => this.sock.write(data, (err) => (err ? reject(err) : resolve())));
+  }
+
+  close(): Promise<void> {
+    return new Promise((resolve) => {
+      if (this.sock.destroyed) return resolve();
+      this.sock.once('close', () => resolve());
+      this.sock.end();
+      setTimeout(() => this.sock.destroy(), 500).unref();
+    });
+  }
 }
