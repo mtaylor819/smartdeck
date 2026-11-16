@@ -111,6 +111,15 @@ function unmaskConfig(next: Config, current: Config): Config {
   return next;
 }
 
+/** After unmasking, any secret still starting with the mask is garbage like "***abc" (typed onto the placeholder): refuse to store it. */
+function assertNoMaskedGarbage(c: Config): void {
+  for (const p of SECRET_PATHS) {
+    const t = getPath(c, p);
+    const v = t?.parent[t.key];
+    if (typeof v === 'string' && v.startsWith(MASK)) throw new HttpError(400, `${p.join('.')} looks like a masked placeholder (starts with ***). Re-enter the secret.`);
+  }
+}
+
 export async function startServer(api: DaemonApi, opts: ServerOptions = {}): Promise<RunningServer> {
   const host = opts.host ?? '127.0.0.1';
   const fetchImpl: FetchLike = opts.fetchImpl ?? ((u) => fetch(u) as any);
@@ -172,6 +181,7 @@ export async function startServer(api: DaemonApi, opts: ServerOptions = {}): Pro
         if (method === 'GET' && path === '/api/config') return json(res, 200, maskConfig(api.getConfig()));
         if (method === 'PUT' && path === '/api/config') {
           const next = unmaskConfig((await readJson(req)) as Config, api.getConfig());
+          assertNoMaskedGarbage(next);
           try {
             api.setConfig(next);
           } catch (e) {

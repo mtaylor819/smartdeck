@@ -175,6 +175,7 @@ export function validate(c: Config): Config {
     if (p.buttons.length > cells)
       throw new Error(`page ${i} has ${p.buttons.length} buttons but the grid only has ${cells} cells`);
   });
+  if (typeof c.brightness !== 'number' || !Number.isFinite(c.brightness) || c.brightness < 0 || c.brightness > 100) throw new Error('brightness must be a number from 0 to 100');
   if (!(c.knob.step > 0)) throw new Error('knob.step must be > 0');
   if (c.sleepScreen !== undefined && !['clock', 'diag', 'diag-anim', 'warp'].includes(c.sleepScreen))
     throw new Error("sleepScreen must be 'clock', 'diag', 'diag-anim' or 'warp'");

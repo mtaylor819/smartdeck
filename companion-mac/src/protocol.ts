@@ -115,7 +115,11 @@ export const cmd = {
   endUpload: () => 'END_UPLOAD',
   fileHeader: (name: string, size: number) => `FILE:${name}:${size}`,
   setTime: (d: Date) => `SET_TIME:${p2(d.getHours())}:${p2(d.getMinutes())}:${p2(d.getSeconds())}`,
-  setBrightness: (pct: number) => `SET_BRIGHTNESS:${clamp(Math.round(pct), 0, 100)}`,
+  setBrightness: (pct: number) => {
+    // NaN would be read by the firmware as 0 (black screen): refuse instead of guessing.
+    if (!Number.isFinite(pct)) throw new Error('brightness must be a number');
+    return `SET_BRIGHTNESS:${clamp(Math.round(pct), 0, 100)}`;
+  },
   setSleep: (minutes: number) => `SET_SLEEP:${Math.max(0, Math.round(minutes))}`,
   setDeepSleep: (minutes: number) => `SET_DEEP_SLEEP:${Math.max(0, Math.round(minutes))}`,
   setDimLed: (anim: string) => `SET_DIM_LED:${anim}`,

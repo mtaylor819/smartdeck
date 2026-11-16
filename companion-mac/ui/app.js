@@ -160,7 +160,31 @@ const FIELDS = {
   counter: [['counterStartValue', 'Start value', 'num'], ['counterAction', 'On press', 'select', ['increment', 'decrement', 'reset']]],
 };
 
-function row(label, input) { return h('div', { class: 'row' }, h('label', {}, label), input); }
+let rowSeq = 0;
+function row(label, input) {
+  const lab = h('label', {}, label);
+  // link the label to a plain control so screen readers (and clicking the label) work
+  if (input && input.matches && input.matches('input,select,textarea')) {
+    if (!input.id) input.id = 'f' + (++rowSeq);
+    lab.htmlFor = input.id;
+  }
+  return h('div', { class: 'row' }, lab, input);
+}
+
+const MASKED = '***';
+/** Password-style input for a server-masked secret. An untouched saved secret stays '***' (server keeps the real one). */
+function secretInput(peek, make, key, placeholder) {
+  const saved = peek()?.[key] === MASKED;
+  return h('input', {
+    type: 'password', autocomplete: 'off', placeholder: saved ? 'saved (type to replace)' : (placeholder || ''),
+    value: saved ? '' : (peek()?.[key] ?? ''),
+    oninput: (e) => {
+      const o = make();
+      if (e.target.value === '') { if (saved) o[key] = MASKED; else delete o[key]; } else o[key] = e.target.value;
+      markDirty();
+    },
+  });
+}
 
 function fieldInput(obj, key, kind, extra, onChange) {
   const set = (v) => { if (v === '' || v === undefined) delete obj[key]; else obj[key] = v; onChange(); };
@@ -185,19 +209,30 @@ function fieldInput(obj, key, kind, extra, onChange) {
     case 'combo': {
       const input = h('input', { type: 'text', value: cur ?? '', placeholder: 'cmd+shift+4', oninput: (e) => set(e.target.value) });
       const rec = h('button', { type: 'button', class: 'small' }, 'Record');
+      let onKey = null, away = null;
+      const stop = () => {
+        if (onKey) window.removeEventListener('keydown', onKey, true);
+        if (away) document.removeEventListener('mousedown', away, true);
+        onKey = away = null;
+        rec.textContent = 'Record';
+      };
       rec.addEventListener('click', () => {
-        rec.textContent = 'Press keys…';
-        const onKey = (e) => {
+        stop();
+        rec.textContent = 'Press keys… (Esc cancels)';
+        onKey = (e) => {
           e.preventDefault();
+          if (e.key === 'Escape') return stop();
           const k = comboFromEvent(e);
           if (!k) return; // only modifiers so far
-          window.removeEventListener('keydown', onKey, true);
-          rec.textContent = 'Record';
+          stop();
           input.value = k;
           set(k);
         };
+        away = (e) => { if (e.target !== rec) stop(); }; // clicking anywhere else cancels
         window.addEventListener('keydown', onKey, true);
+        document.addEventListener('mousedown', away, true);
       });
+      rec.addEventListener('blur', stop);
       return h('div', { class: 'inline' }, input, rec);
     }
     default: return h('input', { type: 'text', value: cur ?? '', oninput: (e) => set(e.target.value) });
@@ -522,9 +557,9 @@ function drawSettings() {
 
   const general = h('div', {}, h('h3', {}, 'Deck'),
     row('Title', txt(c, 'title')),
-    row('Columns', h('input', { type: 'number', min: 1, max: MAX_COLS, value: c.grid.cols, oninput: (e) => { c.grid.cols = clampInt(e.target.value, 1, MAX_COLS); chg(); } })),
-    row('Rows', h('input', { type: 'number', min: 1, max: MAX_ROWS, value: c.grid.rows, oninput: (e) => { c.grid.rows = clampInt(e.target.value, 1, MAX_ROWS); chg(); } })),
-    row('Brightness %', num(c, 'brightness', { min: 0, max: 100 })),
+    row('Columns', h('input', { type: 'number', min: 1, max: MAX_COLS, value: c.grid.cols, onchange: (e) => { const n = clampInt(e.target.value, 1, MAX_COLS); if (!confirmShrink(c, n, c.grid.rows)) { e.target.value = c.grid.cols; return; } c.grid.cols = n; chg(); } })),
+    row('Rows', h('input', { type: 'number', min: 1, max: MAX_ROWS, value: c.grid.rows, onchange: (e) => { const n = clampInt(e.target.value, 1, MAX_ROWS); if (!confirmShrink(c, c.grid.cols, n)) { e.target.value = c.grid.rows; return; } c.grid.rows = n; chg(); } })),
+    row('Brightness %', h('input', { type: 'number', min: 0, max: 100, value: c.brightness ?? 80, oninput: (e) => { if (e.target.value === '') return; c.brightness = clampInt(e.target.value, 0, 100); chg(); } })),
     h('h3', {}, 'Theme'),
     ...[['bg_color', 'Background'], ['btn_color', 'Buttons'], ['text_color', 'Text'], ['stroke_color', 'Border'], ['shadow_color', 'Shadow']]
       .map(([k, l]) => row(l, colorInput(c.theme, k, '000000', chg, false))));
@@ -586,7 +621,7 @@ function drawSettings() {
   const ha = (c.integrations.homeassistant ||= { url: '' });
   const haBox = h('div', {}, h('h3', {}, 'Home Assistant'),
     row('URL', txt(ha, 'url', { placeholder: 'http://homeassistant.local:8123' })),
-    row('Access token', h('input', { type: 'password', value: ha.token ?? '', autocomplete: 'off', oninput: (e) => { if (e.target.value) ha.token = e.target.value; else delete ha.token; chg(); } })),
+    row('Access token', secretInput(() => ha, () => ha, 'token')),
     row('…or env var', txt(ha, 'tokenEnv', { placeholder: 'HA_TOKEN' })),
     h('div', { class: 'muted' }, 'A saved token is shown as ***. Leave it to keep the existing token.'));
 
@@ -595,14 +630,13 @@ function drawSettings() {
   const sub = (key, init) => (d[key] ||= init);
   const secret = (obj, key, ph) => h('input', { type: 'password', autocomplete: 'off', placeholder: ph || '', value: obj[key] ?? '',
     oninput: (e) => { if (e.target.value) obj[key] = e.target.value; else delete obj[key]; chg(); } });
-  const tokenInput = h('input', { type: 'password', autocomplete: 'off', value: d.token ?? '', placeholder: '8-64 characters',
-    oninput: (e) => { if (e.target.value) d.token = e.target.value; else delete d.token; chg(); } });
-  const genToken = () => { const a = new Uint8Array(12); crypto.getRandomValues(a); d.token = [...a].map((x) => x.toString(16).padStart(2, '0')).join(''); tokenInput.value = d.token; tokenInput.type = 'text'; chg(); };
+  const tokenInput = secretInput(() => d, () => d, 'token', '8-64 characters');
+  const genToken = () => { const a = new Uint8Array(12); crypto.getRandomValues(a); d.token = [...a].map((x) => x.toString(16).padStart(2, '0')).join(''); tokenInput.value = d.token; tokenInput.type = 'text'; chg(); toast('Token generated. Push it to the deck over USB (Push to deck) before using WiFi.'); };
   const connBox = h('div', {}, h('h3', {}, 'Deck connectivity (WiFi / Bluetooth)'),
     h('div', { class: 'muted' }, 'Needs the updated firmware. WiFi password and tokens are only ever sent over USB, never over the network.'),
     h('h4', {}, 'WiFi'),
     row('Network (SSID)', h('input', { type: 'text', value: d.wifi?.ssid ?? '', oninput: (e) => { sub('wifi', { ssid: '' }).ssid = e.target.value; chg(); } })),
-    row('Password', h('input', { type: 'password', autocomplete: 'off', value: d.wifi?.password ?? '', oninput: (e) => { const w = sub('wifi', { ssid: '' }); if (e.target.value) w.password = e.target.value; else delete w.password; chg(); } })),
+    row('Password', secretInput(() => d.wifi, () => sub('wifi', { ssid: '' }), 'password')),
     row('Deck address', txt(d, 'address', { placeholder: 'smartdeck.local or 192.168.1.50' })),
     row('Deck hostname', txt(d, 'host', { placeholder: 'smartdeck' })),
     row('Link / OTA token', h('div', { class: 'inline' }, tokenInput, h('button', { class: 'small', onclick: genToken }, 'Generate'))),
@@ -615,7 +649,7 @@ function drawSettings() {
       oninput: (e) => { const b = sub('ble', { enabled: false }); const arr = [...(b.slots || ['', '', ''])]; arr[i] = e.target.value; while (arr.length && !arr[arr.length - 1]) arr.pop(); if (arr.length) b.slots = arr.map((x, j) => x || ['Mac', 'PC', 'iPad'][j]); else delete b.slots; chg(); } })))),
     row('Bluetooth name', h('input', { type: 'text', placeholder: 'SmartDeck', value: d.ble?.name ?? '', oninput: (e) => { const b = sub('ble', { enabled: false }); if (e.target.value) b.name = e.target.value; else delete b.name; chg(); } })),
     row('Home Assistant URL', h('input', { type: 'text', placeholder: 'http://homeassistant.local:8123', value: d.ha?.url ?? '', oninput: (e) => { sub('ha', { url: '' }).url = e.target.value; chg(); } })),
-    row('HA token (deck)', h('input', { type: 'password', autocomplete: 'off', value: d.ha?.token ?? '', oninput: (e) => { const x = sub('ha', { url: '' }); if (e.target.value) x.token = e.target.value; else delete x.token; chg(); } })),
+    row('HA token (deck)', secretInput(() => d.ha, () => sub('ha', { url: '' }), 'token')),
     h('div', { class: 'inline' }, h('button', { onclick: async () => { try { await api('POST', '/api/provision', {}); toast('Sent to deck'); } catch (e) { toast(e.message, true); } } }, 'Push to deck (USB)')));
 
   const ad = () => (d.autodim ||= { enabled: false, min: 10, max: 100 });
@@ -656,6 +690,13 @@ function drawSettings() {
   v.append(h('div', { class: 'inline' }, h('h2', {}, 'Settings'), h('div', { class: 'spacer' }), h('button', { onclick: () => setView('editor') }, '← Back to buttons')),
     h('div', { class: 'grid2' }, h('div', {}, general, power, sleepBox, schedBox, soundsBox), h('div', {}, knobBox, connBox, deckBox, alertBox, trigBox, wBox, rules, haBox)));
 }
+/** Shrinking the grid silently drops buttons that no longer fit: ask first. */
+function confirmShrink(c, cols, rows) {
+  const cells = cols * rows;
+  let lost = 0;
+  for (const p of c.pages) p.buttons.forEach((b, i) => { if (b && i >= cells) lost++; });
+  return lost === 0 || confirm(`This grid has ${cells} cells: ${lost} button(s) would be removed. Continue?`);
+}
 function clampInt(v, lo, hi) { return Math.min(hi, Math.max(lo, Math.round(Number(v)) || lo)); }
 
 // ---------- view / status ----------
@@ -676,7 +717,8 @@ async function pollStatus() {
     const n = s.net || {};
     const extra = [s.link === 'wifi' ? 'WiFi' : s.link === 'usb' ? 'USB' : '', n.ble && n.ble !== 'off' ? 'BT ' + n.ble : '', s.lux !== undefined ? s.lux + ' lux' : ''].filter(Boolean).join(' · ');
     $('connText').textContent = s.connected ? `${s.deviceName || 'Deck'}${extra ? ' · ' + extra : ''} · page ${s.page + 1}` : 'Deck not connected';
-    $('logText').textContent = (s.log || []).join('\n');
+    const logTxt = (s.log || []).join('\n');
+    if ($('logText').textContent !== logTxt) $('logText').textContent = logTxt;
   } catch {
     $('conn').className = 'conn off';
     $('connText').textContent = 'Daemon unreachable';
@@ -685,18 +727,26 @@ async function pollStatus() {
 
 async function save() {
   try {
-    const next = await api('PUT', '/api/config', trimConfig(state.cfg));
-    state.cfg = next; state.savedJson = JSON.stringify(trimConfig(next));
-    toast('Saved');
-    state.view === 'settings' ? drawSettings() : refreshEditor();
-  } catch (e) { toast(e.message, true); }
+    const sent = JSON.stringify(trimConfig(state.cfg));
+    const next = await api('PUT', '/api/config', JSON.parse(sent));
+    state.savedJson = JSON.stringify(trimConfig(next));
+    if (JSON.stringify(trimConfig(state.cfg)) === sent) {
+      state.cfg = next;
+      toast('Saved');
+      state.view === 'settings' ? drawSettings() : refreshEditor();
+    } else {
+      markDirty(); // edited while saving: keep the newer edits, still dirty
+      toast('Saved (you made more changes while saving: save again)');
+    }
+    return true;
+  } catch (e) { toast(e.message, true); return false; }
 }
 
 async function init() {
   $('saveBtn').addEventListener('click', save);
   $('syncBtn').addEventListener('click', async () => {
     if (isDirty() && !confirm('You have unsaved changes. Sync uses the saved config. Save first?')) return;
-    if (isDirty()) await save();
+    if (isDirty() && !(await save())) return; // do not sync a stale config after a failed save
     $('syncBtn').disabled = true; $('syncBtn').textContent = 'Syncing…';
     try { await api('POST', '/api/sync'); toast('Synced — the deck is rebooting'); } catch (e) { toast(e.message, true); }
     $('syncBtn').disabled = false; $('syncBtn').textContent = 'Sync to deck';
@@ -727,4 +777,23 @@ init();
   };
   tick();
   setInterval(tick, 30000);
+})();
+
+
+// ---------- keyboard access: make clickable divs/imgs focusable and operable with Enter/Space ----------
+(function () {
+  const SEL = '.tab, .cell, .icons img, .ifyicon';
+  const fix = (el) => {
+    if (el.nodeType !== 1) return;
+    const list = el.matches(SEL) ? [el, ...el.querySelectorAll(SEL)] : [...el.querySelectorAll(SEL)];
+    for (const n of list) {
+      if (n.getAttribute('tabindex') === null) n.setAttribute('tabindex', '0');
+      if (!n.getAttribute('role')) n.setAttribute('role', 'button');
+    }
+  };
+  new MutationObserver((muts) => muts.forEach((m) => m.addedNodes.forEach(fix))).observe(document.body, { childList: true, subtree: true });
+  fix(document.body);
+  document.addEventListener('keydown', (e) => {
+    if ((e.key === 'Enter' || e.key === ' ') && e.target.matches && e.target.matches(SEL)) { e.preventDefault(); e.target.click(); }
+  });
 })();
