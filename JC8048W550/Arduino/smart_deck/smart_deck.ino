@@ -132,6 +132,9 @@ uint8_t led_brightness = 255;  // LED brightness (0-255)
 #endif
 // --- END ---
 
+// [net] Serial tee: lets the WiFi TCP host link share every Serial.* call (host_io.h). Must stay before the first Serial use.
+#include "host_io.h"
+
 // Touch Panel
 TAMC_GT911 tp(TOUCH_SDA, TOUCH_SCL, TOUCH_INT, TOUCH_RST, TOUCH_WIDTH, TOUCH_HEIGHT);
 
@@ -235,6 +238,8 @@ void checkActiveTimers();
 
 
 bool host_link_active();                                              // features.h
+bool net_standalone_always();                                         // net_wifi.h ([net] "standalone":"always" runs on-device even with a host)
+bool net_tcp_take_line(String& out);                                   // net_wifi.h ([net] next command line from the WiFi host link)
 bool standalone_button(int page, int idx, bool hasState, bool state);  // features.h
 
 // *** NEW: Send Command to PC/Dongle Function (State Supported) ***
@@ -242,7 +247,7 @@ void send_pc_command(int page, int index) {
   char command[64];
 
   // No host app connected? Try to run the button on the deck itself (BLE keyboard / WiFi Home Assistant).
-  if (!host_link_active()) {
+  if (!host_link_active() || net_standalone_always()) {
     bool st = (index >= 0 && index < (int)current_toggles.size()) ? current_toggles[index].state : false;
     bool isToggle = current_buttons[index].action == "toggle";
     if (standalone_button(page, index, isToggle, st)) return;
@@ -2273,8 +2278,8 @@ void loop() {
   // ============================================================
   // 2. SERİ PORT KOMUTLARI (PC'den Gelenler)
   // ============================================================
-  if (Serial.available() > 0) {
-    String command = Serial.readStringUntil('\n');
+  // [net] The handler chain below is unchanged; it is now a lambda so the same code serves USB and the WiFi TCP link.
+  auto handle_host_command = [&](String command) {
     command.trim();
     if (features_command(command)) command = "";  // feature modules get first look (features.h)
 
@@ -3017,6 +3022,17 @@ void loop() {
         Serial.println("CONFIG_ERROR:Cannot open file");
       }
       update_activity();
+    }
+  };  // end handle_host_command
+
+  // [net] USB: exactly as before. WiFi: one complete line per loop; replies and upload reads follow that link.
+  if (Serial.available() > 0) handle_host_command(Serial.readStringUntil('\n'));
+  {
+    String tcpLine;
+    if (net_tcp_take_line(tcpLine)) {
+      Serial.useTcpInput(true);
+      handle_host_command(tcpLine);
+      Serial.useTcpInput(false);
     }
   }
 

@@ -70,3 +70,26 @@ touch changed regions. Waking redraws the normal page as before. Binary size gre
   periodically, which would keep the deck awake forever. `SET_BTN_DATA` is now excluded from the wake path and skips the redraw while
   the deck is dimmed/deep-sleeping (waking redraws the page from the stored config anyway).
 - **Diagnostics sleep screen** (`SET_SLEEP_SCREEN` / `DIAG`), described above.
+
+## WiFi, host link and OTA (`net_wifi.h`, `host_io.h`)
+
+Provisioned with `SET_NET:{...}` over USB (or an already-authenticated link); see `companion-mac/PROTOCOL.md` for the full contract.
+Example: `SET_NET:{"ssid":"MyWifi","pass":"secret-pass","host":"smartdeck","token":"a-long-random-token","tz":"GMT0BST,M3.5.0/1,M10.5.0/2"}`.
+
+- **WiFi** connects asynchronously (retry back-off 1, 2, 4 ... 60 s) and advertises `smartdeck.local` / `_smartdeck._tcp` on port 7778.
+- **Host link**: TCP 7778, first line `AUTH:<token>`. 5 failed attempts lock new connections out for 30 s; unauthenticated clients are dropped after 5 s.
+  `host_io.h` makes the sketch's `Serial` write to USB exactly as before *and* tee to the authenticated client, and read from it while a
+  TCP-originated command (e.g. `START_UPLOAD`) is running. NOTE: `#define Serial` is active for every header included after
+  `host_io.h` in `smart_deck.ino`; third-party library *headers* with inline `Serial` use should be included before it.
+- **OTA**: `curl -X POST -H "X-SmartDeck-Token: <token>" --data-binary @smart_deck.ino.bin http://smartdeck.local:7779/update`.
+  Send the **app** image (`firmware/dist/parts/smart_deck.ino.bin`), not the merged image; the deck checks the ESP image magic and the
+  app-descriptor magic before writing and rejects anything else (merged image / bootloader / random file).
+  The image is written to the inactive slot (`app0`/`app1`, 3 MB each) and the deck reboots into it.
+- **No automatic rollback.** The Arduino-ESP32 2.0.17 precompiled bootloader is built without app rollback. If an OTA image boots but
+  crashes or boot-loops, OTA can't help: reflash over USB (`flash` command / esptool, download mode as described above).
+  Test new images on the bench before flashing a deck you can't reach.
+- **Secrets** (WiFi password, token, Home Assistant token) are stored in plain NVS (Preferences namespace `net`); they are never printed or
+  echoed (`GET_NET` omits them). Anyone with physical access can read flash. The link is unencrypted TCP; use it on a trusted LAN.
+- **Standalone** `ha` / `http` buttons run on a short-lived task with 3 s timeouts when no host is connected (or always, with
+  `"standalone":"always"`). `https://` skips certificate verification (`setInsecure`): the deck has no CA bundle.
+- **NTP**: once WiFi is up the deck sets its own clock (TZ from `tz`) unless a host has sent `SET_TIME` in the last 10 minutes.
