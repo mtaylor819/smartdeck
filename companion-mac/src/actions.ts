@@ -122,6 +122,7 @@ export class ActionExecutor {
     private sleep: (ms: number) => Promise<void> = (ms) => new Promise((r) => setTimeout(r, ms)),
     private ha: () => HaSettings | undefined = () => undefined,
     private alert: (a: Extract<Action, { type: 'alert' }>) => Promise<void> = async () => {},
+    private sendLine: (line: string) => Promise<void> = async () => { throw new Error('deck not connected'); },
   ) {}
 
   /** Execute an action. `toggleState` is the state the deck reports for toggle buttons. */
@@ -178,6 +179,9 @@ export class ActionExecutor {
         return this.callHomeAssistant(action);
       case 'alert':
         return this.alert(action);
+      case 'blehost':
+        if (![1, 2, 3, 'next'].includes(action.slot as any)) throw new Error('blehost slot must be 1, 2, 3 or next');
+        return this.sendLine(`BLE_HOST:${action.slot}`);
       case 'delay':
         return this.sleep(action.ms);
       case 'multi':

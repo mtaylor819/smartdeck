@@ -58,12 +58,15 @@ export class Daemon implements DaemonApi {
     this.capture = opts.capture ?? defaultCapture;
     this.fetchImpl = opts.fetchImpl ?? fetch;
     const ha = () => this.config.integrations?.homeassistant;
-    this.exec = new ActionExecutor(opts.runner, (m) => this.log(m), this.fetchImpl, undefined, ha);
+    this.exec = new ActionExecutor(opts.runner, (m) => this.log(m), this.fetchImpl, undefined, ha,
+      (a) => this.alert(a.kind, a.seconds ?? 0, a.text ?? ''), (l) => this.send(l));
     this.widgets = new WidgetManager(
       () => this.config,
       (l) => this.send(l),
       { capture: this.capture, fetchImpl: this.fetchImpl, ha, cpuTimes: defaultCpuTimes },
       (m) => this.log(m),
+      undefined, undefined,
+      () => !!this.deck?.net.caps?.includes('btn_live'),
     );
     this.diag = new DiagCollector(this.capture, makeCpuMeter());
     this.sounds = new SoundPlayer(() => this.config, opts.runner ?? defaultRunner, (m) => this.log(m));

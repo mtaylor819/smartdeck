@@ -127,6 +127,7 @@ const TYPES = {
   http: { label: 'HTTP request', def: () => ({ type: 'http', url: 'https://', method: 'GET' }) },
   ha: { label: 'Home Assistant', def: () => ({ type: 'ha', service: 'light.toggle', entity: '' }) },
   alert: { label: 'LED alert (red alert…)', def: () => ({ type: 'alert', kind: 'red', seconds: 10, text: '' }) },
+  blehost: { label: 'Bluetooth host (device)', def: () => ({ type: 'blehost', slot: 'next' }), noNest: true },
   multi: { label: 'Multi-action', def: () => ({ type: 'multi', steps: [] }) },
   delay: { label: 'Delay', def: () => ({ type: 'delay', ms: 500 }), stepOnly: true },
   toggle: { label: 'Toggle', def: () => ({ type: 'toggle', on: { type: 'none' }, off: { type: 'none' } }), noNest: true },
@@ -152,6 +153,7 @@ const FIELDS = {
   http: [['url', 'URL', 'text'], ['method', 'Method', 'select', ['GET', 'POST', 'PUT', 'DELETE']], ['body', 'Body', 'area'], ['headers', 'Headers (JSON)', 'json']],
   ha: [['service', 'Service (domain.service)', 'text'], ['entity', 'Entity id', 'text'], ['data', 'Extra data (JSON)', 'json']],
   alert: [['kind', 'Alert', 'select', ['red', 'yellow', 'blue', 'green', 'off']], ['seconds', 'Seconds (0 = until acked)', 'num'], ['text', 'Banner text', 'text']],
+  blehost: [['slot', 'Switch to', 'slot']],
   delay: [['ms', 'Milliseconds', 'num']],
   goto: [['page', 'Page (1-based)', 'num']],
   timer: [['duration', 'Seconds', 'num']],
@@ -166,6 +168,8 @@ function fieldInput(obj, key, kind, extra, onChange) {
   switch (kind) {
     case 'area': return h('textarea', { value: cur ?? '', oninput: (e) => set(e.target.value) });
     case 'num': return h('input', { type: 'number', value: cur ?? '', oninput: (e) => set(e.target.value === '' ? '' : Number(e.target.value)) });
+    case 'slot': return h('select', { onchange: (e) => set(e.target.value === 'next' ? 'next' : Number(e.target.value)) },
+      [['1', 'Slot 1'], ['2', 'Slot 2'], ['3', 'Slot 3'], ['next', 'Next slot']].map(([v, l]) => h('option', { value: v, selected: String(cur) === v }, l)));
     case 'select': return h('select', { onchange: (e) => set(e.target.value) }, extra.map((o) => h('option', { value: o, selected: o === cur }, o)));
     case 'json': {
       const err = h('div', { class: 'err' });
@@ -397,6 +401,22 @@ function redrawPanel() {
   drawHold();
   panel.append(holdBox);
 
+  const haBox = h('div', {});
+  const drawHa = () => {
+    haBox.replaceChildren(h('h4', {}, 'Home Assistant state'),
+      row('Show state', h('input', { type: 'checkbox', checked: !!b.haState, onchange: (e) => { if (e.target.checked) b.haState = { entity: b.action?.type === 'ha' && b.action.entity ? b.action.entity : '' }; else delete b.haState; markDirty(); drawHa(); } })));
+    if (b.haState) {
+      const hs = b.haState;
+      const t2 = (k, ph) => h('input', { type: 'text', placeholder: ph || '', value: hs[k] ?? '', oninput: (e) => { if (e.target.value === '') delete hs[k]; else hs[k] = e.target.value; markDirty(); } });
+      haBox.append(row('Entity', t2('entity', 'light.desk')), row('ON colour', colorInput(hs, 'on', '1a8f3c', markDirty)), row('OFF colour', colorInput(hs, 'off', '333333', markDirty)),
+        row('ON label', t2('label_on', 'ON')), row('OFF label', t2('label_off', 'OFF')),
+        row('Poll every (s)', h('input', { type: 'number', min: 5, placeholder: '10', value: hs.interval ?? '', oninput: (e) => { if (e.target.value === '') delete hs.interval; else hs.interval = Number(e.target.value); markDirty(); } })),
+        h('div', { class: 'muted' }, 'The Mac updates the button while connected; the deck polls Home Assistant itself when standalone (needs the updated firmware).'));
+    }
+  };
+  drawHa();
+  panel.append(haBox);
+
   panel.append(h('h4', {}, 'Live widget'), widgetEditor(b, changed));
 }
 
@@ -591,6 +611,8 @@ function drawSettings() {
     row('Run on the deck', h('select', { onchange: (e) => { if (e.target.value === 'auto') delete d.standalone; else d.standalone = e.target.value; chg(); } },
       [['auto', 'Only when no Mac is connected'], ['always', 'Always'], ['never', 'Never']].map(([v2, l]) => h('option', { value: v2, selected: (d.standalone || 'auto') === v2 }, l)))),
     row('Bluetooth keyboard', h('input', { type: 'checkbox', checked: !!d.ble?.enabled, onchange: (e) => { sub('ble', { enabled: false }).enabled = e.target.checked; chg(); } })),
+    row('BT host names', h('div', { class: 'inline' }, [0, 1, 2].map((i) => h('input', { type: 'text', maxlength: 12, placeholder: ['Mac', 'PC', 'iPad'][i], value: d.ble?.slots?.[i] ?? '',
+      oninput: (e) => { const b = sub('ble', { enabled: false }); const arr = [...(b.slots || ['', '', ''])]; arr[i] = e.target.value; while (arr.length && !arr[arr.length - 1]) arr.pop(); if (arr.length) b.slots = arr.map((x, j) => x || ['Mac', 'PC', 'iPad'][j]); else delete b.slots; chg(); } })))),
     row('Bluetooth name', h('input', { type: 'text', placeholder: 'SmartDeck', value: d.ble?.name ?? '', oninput: (e) => { const b = sub('ble', { enabled: false }); if (e.target.value) b.name = e.target.value; else delete b.name; chg(); } })),
     row('Home Assistant URL', h('input', { type: 'text', placeholder: 'http://homeassistant.local:8123', value: d.ha?.url ?? '', oninput: (e) => { sub('ha', { url: '' }).url = e.target.value; chg(); } })),
     row('HA token (deck)', h('input', { type: 'password', autocomplete: 'off', value: d.ha?.token ?? '', oninput: (e) => { const x = sub('ha', { url: '' }); if (e.target.value) x.token = e.target.value; else delete x.token; chg(); } })),

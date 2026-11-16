@@ -186,6 +186,19 @@ export function validate(c: Config): Config {
     if (d.ble?.name !== undefined && !/^[\x20-\x7e]{1,24}$/.test(d.ble.name)) throw new Error('device.ble.name must be 1-24 printable characters');
     if (d.autodim && !(d.autodim.min >= 0 && d.autodim.max <= 100 && d.autodim.min <= d.autodim.max)) throw new Error('device.autodim needs 0 <= min <= max <= 100');
   }
+  if (d?.ble?.slots !== undefined) {
+    if (!Array.isArray(d.ble.slots) || d.ble.slots.length < 1 || d.ble.slots.length > 3 || d.ble.slots.some((n) => typeof n !== 'string' || !/^[\x20-\x7e]{1,12}$/.test(n)))
+      throw new Error('device.ble.slots must be 1-3 names of 1-12 printable characters');
+  }
+  c.pages.forEach((p, pi) => p.buttons.forEach((b, bi) => {
+    if (b?.haState) {
+      const h = b.haState;
+      if (!/^[a-z_]+\.[a-z0-9_]+$/.test(h.entity ?? '')) throw new Error(`page ${pi + 1} button ${bi + 1}: haState.entity must look like light.desk`);
+      for (const k of ['on', 'off'] as const) if (h[k] !== undefined && !/^[0-9a-fA-F]{6}$/.test(h[k]!)) throw new Error(`page ${pi + 1} button ${bi + 1}: haState.${k} must be 6 hex digits`);
+      if (h.interval !== undefined && !(h.interval >= 5)) throw new Error(`page ${pi + 1} button ${bi + 1}: haState.interval must be >= 5 seconds`);
+    }
+    if (b?.action?.type === 'blehost' && ![1, 2, 3, 'next'].includes(b.action.slot as any)) throw new Error(`page ${pi + 1} button ${bi + 1}: blehost slot must be 1, 2, 3 or next`);
+  }));
   for (const r of c.brightnessSchedule ?? []) {
     if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(r.from) || !/^([01]\d|2[0-3]):[0-5]\d$/.test(r.to)) throw new Error('brightnessSchedule times must be HH:MM');
     if (!(r.brightness >= 0 && r.brightness <= 100)) throw new Error('brightnessSchedule brightness must be 0-100');

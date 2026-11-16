@@ -1,5 +1,8 @@
 #!/usr/bin/env node
 import { execFile } from 'node:child_process';
+import { existsSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { platform } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { configPath, loadConfig, writeDefaultConfig } from './config.js';
 import { Daemon } from './daemon.js';
@@ -7,11 +10,15 @@ import { flashArgs, runEsptool, verifyChecksum } from './flash.js';
 import { startServer } from './server.js';
 import { otaUpdate } from './ota.js';
 import { installService } from './service.js';
-import { listCandidatePorts } from './transport.js';
+import { defaultCapture } from './actions.js';
+import type { DeckStatus } from './api.js';
+import { DeckProbe, formatChecks, probeNet, runDoctor } from './doctor.js';
+import { findDeck, listCandidatePorts, TcpTransport } from './transport.js';
 
-/** Talk to the already-running daemon's local API (fetches the page for its per-process CSRF token first). */
-async function daemonPost(path: string, body: unknown): Promise<void> {
-  const base = `http://127.0.0.1:${loadConfig().ui?.port ?? 7777}`;
+const uiBase = () => `http://127.0.0.1:${(() => { try { return loadConfig().ui?.port ?? 7777; } catch { return 7777; } })()}`;
+
+/** Fetch the running daemon's page for its per-process CSRF token (localhost only). */
+async function daemonToken(base = uiBase()): Promise<string> {
   let page: string;
   try {
     page = await (await fetch(base + '/')).text();
@@ -20,9 +27,56 @@ async function daemonPost(path: string, body: unknown): Promise<void> {
   }
   const token = /name="csrf-token" content="([^"]+)"/.exec(page)?.[1];
   if (!token) throw new Error('daemon did not provide a token');
+  return token;
+}
+
+/** Talk to the already-running daemon's local API. */
+async function daemonPost(path: string, body: unknown): Promise<void> {
+  const base = uiBase();
+  const token = await daemonToken(base);
   const res = await fetch(base + path, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-SmartDeck-Token': token }, body: JSON.stringify(body) });
   const json = (await res.json().catch(() => ({}))) as { error?: string };
   if (!res.ok) throw new Error(json.error ?? `HTTP ${res.status}`);
+}
+
+async function daemonStatus(): Promise<DeckStatus> {
+  const base = uiBase();
+  const token = await daemonToken(base);
+  const res = await fetch(base + '/api/status', { headers: { 'X-SmartDeck-Token': token } });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return (await res.json()) as DeckStatus;
+}
+
+/** Where the repo (firmware/, sounds/) lives relative to this file, if we are running from a checkout. */
+function repoRoot(): string | undefined {
+  const root = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
+  return existsSync(join(root, 'firmware')) ? root : undefined;
+}
+
+async function probeDeck(): Promise<DeckProbe | null> {
+  try {
+    const st = await daemonStatus();
+    if (st.connected) return { link: st.link ?? 'usb', name: st.deviceName ?? 'Deck', net: st.net && Object.keys(st.net).length ? st.net : null, via: 'daemon' };
+    return null; // daemon owns the serial port: a direct probe would fight it
+  } catch { /* daemon not running: probe directly */ }
+  const found = await findDeck(await listCandidatePorts());
+  if (found) {
+    const net = await probeNet(found.transport);
+    await found.transport.close();
+    return { link: 'usb', name: found.name, net, via: 'direct' };
+  }
+  let cfg;
+  try { cfg = loadConfig(); } catch { return null; }
+  const d = cfg.device;
+  if (d?.address && d.token) {
+    try {
+      const t = await TcpTransport.connect(d.address, d.token);
+      const net = await probeNet(t);
+      await t.close();
+      return { link: 'wifi', name: 'SmartDeck (WiFi)', net, via: 'direct' };
+    } catch { return null; }
+  }
+  return null;
 }
 
 async function main() {
@@ -70,6 +124,29 @@ async function main() {
       if (!port) throw new Error('No serial port found. Hold BOOT while plugging in the deck, then retry.');
       console.log(`Checksum: ${verifyChecksum(bin)}`);
       await runEsptool(flashArgs(port, bin));
+      return;
+    }
+    case 'doctor': {
+      const checks = await runDoctor({
+        platform: platform(), nodeVersion: process.version, capture: defaultCapture, configFile: configPath(),
+        loadConfig: () => loadConfig(), listPorts: listCandidatePorts, probeDeck, uiPort: Number(new URL(uiBase()).port),
+        daemonRunning: async () => { try { await daemonToken(); return true; } catch { return false; } }, repoRoot: repoRoot(),
+      });
+      console.log(formatChecks(checks));
+      if (checks.some((c) => c.status === 'fail')) process.exitCode = 1;
+      return;
+    }
+    case 'status': {
+      // smartdeck-mac status [--short]   (used by the menu-bar plugin)
+      try {
+        const st = await daemonStatus();
+        const extra = [st.link === 'wifi' ? 'WiFi' : st.link === 'usb' ? 'USB' : '', st.net?.ble && st.net.ble !== 'off' ? `BT ${st.net.ble}` : ''].filter(Boolean).join(' · ');
+        console.log(st.connected ? `${st.deviceName ?? 'Deck'}${extra ? ' · ' + extra : ''} · page ${st.page + 1}` : 'Deck not connected');
+        if (!st.connected) process.exitCode = 2;
+      } catch (e) {
+        console.log('SmartDeck not running');
+        process.exitCode = 3;
+      }
       return;
     }
     case 'alert': {
@@ -122,7 +199,7 @@ async function main() {
       return;
     }
     default:
-      console.log('usage: smartdeck-mac [run|open|init|ports|sync|flash|ota|alert|provision|virtual|install-service] [--port /dev/cu.usbmodemXXXX]');
+      console.log('usage: smartdeck-mac [run|open|init|ports|sync|flash|ota|alert|provision|virtual|doctor|status|install-service] [--port /dev/cu.usbmodemXXXX]');
       process.exitCode = 1;
   }
 }

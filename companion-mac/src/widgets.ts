@@ -1,9 +1,10 @@
 import { cpus, freemem, totalmem } from 'node:os';
 import type { Capture, HaSettings } from './actions.js';
-import { Button, Config, toDeviceButton, Widget } from './config.js';
+import { Button, Config, HaStateDisplay, toDeviceButton, Widget } from './config.js';
 import { cmd } from './protocol.js';
 
 export const MIN_INTERVAL_S = 10;
+export const MIN_LIVE_INTERVAL_S = 2;
 const MAX_LABEL = 24;
 
 export interface WidgetDeps {
@@ -101,6 +102,21 @@ export async function readWidget(w: Widget, d: WidgetDeps, state: { prevCpu?: Ar
   }
 }
 
+const HEX6 = /^[0-9a-fA-F]{6}$/;
+
+/** Map a Home Assistant state string to the label/colour a haState button should show. */
+export function renderHaState(h: HaStateDisplay, state: string | null): { label?: string; btnColor?: string } {
+  const out: { label?: string; btnColor?: string } = {};
+  const col = (c?: string) => (c && HEX6.test(c) ? c : undefined);
+  if (state === 'on') { out.btnColor = col(h.on); out.label = h.label_on; }
+  else if (state === 'off') { out.btnColor = col(h.off); out.label = h.label_off; }
+  else { out.btnColor = '444444'; out.label = '?'; } // unavailable / unknown / error
+  if (out.btnColor === undefined) delete out.btnColor;
+  if (out.label === undefined) delete out.label;
+  if (out.label) out.label = out.label.slice(0, MAX_LABEL);
+  return out;
+}
+
 interface Entry {
   page: number;
   index: number;
@@ -129,6 +145,8 @@ export class WidgetManager {
     private log: (m: string) => void = () => {},
     private now: () => number = Date.now,
     private spacingMs = 250,
+    /** True when the deck supports SET_BTN_LIVE (RAM-only, no SD-card writes, no wake). */
+    private useLive: () => boolean = () => false,
   ) {}
 
   start(tickMs = 1000): void {
@@ -153,7 +171,7 @@ export class WidgetManager {
     const seen = new Set<string>();
     cfg.pages.forEach((p, page) =>
       p.buttons.forEach((b, index) => {
-        if (!b?.widget) return;
+        if (!b?.widget && !b?.haState) return;
         const key = `${page}:${index}`;
         seen.add(key);
         const e = this.entries.get(key);
@@ -167,21 +185,43 @@ export class WidgetManager {
     await Promise.all(
       [...this.entries.entries()].map(async ([key, e]) => {
         if (now < e.nextAt) return;
-        const w = e.button.widget!;
-        e.nextAt = now + Math.max(MIN_INTERVAL_S, w.interval ?? 30) * 1000;
+        const live = this.useLive();
+        const ha = e.button.haState;
+        const w = e.button.widget;
+        // live updates never touch the SD card, so they can be much faster than the 10 s SD-friendly floor
+        const floor = live ? MIN_LIVE_INTERVAL_S : MIN_INTERVAL_S;
+        e.nextAt = now + Math.max(floor, (w?.interval ?? ha?.interval ?? (live ? 10 : 30))) * 1000;
         try {
-          const raw = await readWidget(w, this.deps, this.cpuState);
-          const r = renderWidget(w, raw);
-          const sig = `${r.label}|${r.btnColor ?? ''}`;
-          this.values[key] = r.label;
+          let label: string | undefined, btnColor: string | undefined, valueForUi: string;
+          if (w) {
+            const raw = await readWidget(w, this.deps, this.cpuState);
+            const r = renderWidget(w, raw);
+            label = r.label; btnColor = r.btnColor; valueForUi = r.label;
+          } else {
+            let state: string | null = null;
+            try {
+              state = await readWidget({ source: 'ha_state', entity: ha!.entity }, this.deps, this.cpuState);
+            } catch { /* shown as unavailable */ }
+            const r = renderHaState(ha!, state);
+            label = r.label; btnColor = r.btnColor; valueForUi = state ?? '?';
+          }
+          const sig = `${label ?? ''}|${btnColor ?? ''}`;
+          this.values[key] = valueForUi;
           if (sig === e.last) return;
           e.last = sig;
-          const dev = toDeviceButton(e.button)!;
-          dev.label = r.label;
-          if (r.btnColor) dev.btnColor = r.btnColor;
-          this.enqueue(cmd.setBtnData(e.page, e.index, dev));
+          if (live) {
+            const o: { label?: string; btnColor?: string } = {};
+            if (label !== undefined) o.label = label;
+            if (btnColor) o.btnColor = btnColor;
+            this.enqueue(cmd.setBtnLive(e.page, e.index, o));
+          } else {
+            const dev = toDeviceButton(e.button)!;
+            if (label !== undefined) dev.label = label;
+            if (btnColor) dev.btnColor = btnColor;
+            this.enqueue(cmd.setBtnData(e.page, e.index, dev));
+          }
         } catch (err) {
-          this.log(`widget ${key} (${w.source}): ${err instanceof Error ? err.message : err}`);
+          this.log(`widget ${key} (${w?.source ?? 'ha_state'}): ${err instanceof Error ? err.message : err}`);
         }
       }),
     );
