@@ -3,6 +3,8 @@ import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync
 import { dirname, join } from 'node:path';
 import { ActionExecutor, Action, defaultCapture, defaultRunner, Capture, Runner } from './actions.js';
 import { DiagCollector, makeCpuMeter } from './diag.js';
+import { securityRunner } from './keychain-runner.js';
+import { isKeychainRef, Keychain, resolveConfigSecrets } from './secrets.js';
 import { SoundPlayer } from './sounds.js';
 import { AppWatcher } from './appwatch.js';
 import type { DaemonApi, DeckStatus } from './api.js';
@@ -25,6 +27,8 @@ export interface DaemonOptions {
   runner?: Runner;
   capture?: Capture;
   fetchImpl?: typeof fetch;
+  /** Override the Keychain (tests). Defaults to the macOS Keychain on darwin. */
+  keychain?: Keychain;
 }
 
 /** Long-running process: connects to the deck, runs features, and exposes DaemonApi to the UI. */
@@ -43,6 +47,10 @@ export class Daemon implements DaemonApi {
   private schedTimer?: NodeJS.Timeout;
   private lastSched?: number;
   private link?: 'usb' | 'wifi';
+  /** Config with keychain:<name> references replaced by their values. Equal to `config` when none are used. */
+  private resolved: Config;
+  private keychain?: Keychain;
+  private secretWarned = false;
   private lastWifiTry = 0;
   private lastWifiErr = '';
   private diag: DiagCollector;
@@ -55,9 +63,11 @@ export class Daemon implements DaemonApi {
     this.file = opts.configFile ?? configPath();
     writeDefaultConfig(this.file);
     this.config = loadConfig(this.file);
+    this.resolved = this.config;
+    this.keychain = opts.keychain ?? (process.platform === 'darwin' ? new Keychain(securityRunner) : undefined);
     this.capture = opts.capture ?? defaultCapture;
     this.fetchImpl = opts.fetchImpl ?? fetch;
-    const ha = () => this.config.integrations?.homeassistant;
+    const ha = () => this.resolved.integrations?.homeassistant;
     this.exec = new ActionExecutor(opts.runner, (m) => this.log(m), this.fetchImpl, undefined, ha,
       (a) => this.alert(a.kind, a.seconds ?? 0, a.text ?? ''), (l) => this.send(l));
     this.widgets = new WidgetManager(
@@ -98,9 +108,10 @@ export class Daemon implements DaemonApi {
     renameSync(tmp, this.file);
     try { chmodSync(this.file, 0o600); } catch { /* best effort */ }
     this.config = next;
+    this.resolved = next;
+    void this.refreshSecrets().then(() => this.applyLiveSettings());
     this.widgets.reset();
     this.log('config saved');
-    void this.applyLiveSettings();
   }
 
   status(): DeckStatus {
@@ -194,9 +205,27 @@ export class Daemon implements DaemonApi {
     }
   }
 
+  /** Resolve keychain:<name> references into `this.resolved`. Never logs values. */
+  private async refreshSecrets(): Promise<void> {
+    const raw = JSON.stringify(this.config);
+    if (!raw.includes('keychain:')) { this.resolved = this.config; return; }
+    if (!this.keychain) {
+      if (!this.secretWarned) this.log('config uses keychain: references but the macOS Keychain is not available here; those values will be empty');
+      this.secretWarned = true;
+      this.resolved = this.config;
+      return;
+    }
+    try {
+      this.resolved = await resolveConfigSecrets(this.config, this.keychain);
+    } catch (e) {
+      this.log(`keychain: ${e instanceof Error ? e.message : e}`);
+      this.resolved = this.config;
+    }
+  }
+
   /** Settings blob for SET_NET. Secrets (WiFi password, token, HA token) are only included when `secrets` is true. */
   provisionBlob(secrets: boolean): Record<string, unknown> {
-    const d = this.config.device;
+    const d = this.resolved.device;
     const net: Record<string, unknown> = {};
     if (!d) return net;
     if (d.host) net.host = d.host;
@@ -218,7 +247,7 @@ export class Daemon implements DaemonApi {
    */
   private async provisionIfNeeded(force = false): Promise<void> {
     const deck = this.deck;
-    const d = this.config.device;
+    const d = this.resolved.device;
     if (!deck || !d) return;
     const secrets = this.link === 'usb';
     const net = this.provisionBlob(secrets);
@@ -256,7 +285,7 @@ export class Daemon implements DaemonApi {
     const candidates = this.opts.port ? [this.opts.port] : await listCandidatePorts();
     const usb = await findDeck(candidates);
     if (usb) return { ...usb, kind: 'usb' };
-    const d = this.config.device;
+    const d = this.resolved.device;
     if (!d?.address || !d.token || Date.now() - this.lastWifiTry < WIFI_RETRY_MS) return null;
     this.lastWifiTry = Date.now();
     try {
@@ -283,6 +312,7 @@ export class Daemon implements DaemonApi {
     this.appWatch.start();
     this.weatherTimer = setInterval(() => void this.pushWeather(), WEATHER_EVERY_MS);
     this.diagTimer = setInterval(() => void this.pushDiag(), DIAG_EVERY_MS);
+    await this.refreshSecrets();
     this.schedTimer = setInterval(() => void this.applySchedule(), SCHEDULE_EVERY_MS);
     while (!this.stopped) {
       const found = await this.connectLink();

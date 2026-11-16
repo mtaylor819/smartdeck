@@ -133,3 +133,45 @@ test('OTA: image sanity checks and upload request shape', async () => {
   await assert.rejects(otaUpdate('1.2.3.4:7778', 'bad', f, fetch401), /rejected the token/);
   await assert.rejects(otaUpdate('evil.com/x?', 'tok', f, fetchOk), /bad address/);
 });
+
+import { Keychain } from '../src/secrets.js';
+
+test('keychain: references are resolved for the WiFi link; plaintext never needs to be in the config', async () => {
+  const deck = await fakeWifiDeck('tok-12345678', true);
+  const dir = mkdtempSync(join(tmpdir(), 'kc-'));
+  const cfg = defaultConfig();
+  cfg.device = { address: `127.0.0.1:${deck.port}`, token: 'keychain:device-token' };
+  const file = join(dir, 'config.json');
+  writeFileSync(file, JSON.stringify(cfg));
+  const store: Record<string, string> = { 'device-token': 'tok-12345678' };
+  const kc = new Keychain(async (_f, a) => {
+    const name = a[a.indexOf('-a') + 1];
+    if (name in store) return store[name] + '\n';
+    const e: any = new Error('nf'); e.code = 44; throw e;
+  });
+  const d = new Daemon({ configFile: file, port: '/dev/null/none', runner: async () => {}, capture: async () => '', keychain: kc });
+  void d.run();
+  try {
+    await waitFor(() => d.status().connected);
+    assert.equal(d.status().link, 'wifi');
+    assert.ok(JSON.stringify(d.getConfig()).includes('keychain:device-token'), 'config keeps the reference, not the value');
+    assert.ok(!JSON.stringify(d.getConfig()).includes('tok-12345678'));
+  } finally { await d.stop(); deck.close(); }
+});
+
+test('keychain: a missing item does not crash the daemon (logged, connection just fails auth)', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'kc2-'));
+  const cfg = defaultConfig();
+  cfg.device = { address: '127.0.0.1:1', token: 'keychain:nope' };
+  const file = join(dir, 'config.json');
+  writeFileSync(file, JSON.stringify(cfg));
+  const kc = new Keychain(async () => { const e: any = new Error('nf'); e.code = 44; throw e; });
+  const d = new Daemon({ configFile: file, port: '/dev/null/none', runner: async () => {}, capture: async () => '', keychain: kc });
+  void d.run();
+  try {
+    await new Promise((r) => setTimeout(r, 500));
+    assert.equal(d.status().connected, false);
+    assert.ok(d.status().log.some((l) => /keychain/.test(l)));
+    assert.ok(!d.status().log.join('\n').includes('nope-value'));
+  } finally { await d.stop(); }
+});

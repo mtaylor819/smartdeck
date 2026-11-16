@@ -8,7 +8,11 @@ import { configPath, loadConfig, writeDefaultConfig } from './config.js';
 import { Daemon } from './daemon.js';
 import { flashArgs, runEsptool, verifyChecksum } from './flash.js';
 import { startServer } from './server.js';
+import { readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { readSecret, securityRunner } from './keychain-runner.js';
+import { findSwiftbarPluginDir, installSwiftbarPlugin, swiftbarPluginSource } from './menubar.js';
 import { otaUpdate } from './ota.js';
+import { Keychain, migrateSecrets } from './secrets.js';
 import { installService } from './service.js';
 import { defaultCapture } from './actions.js';
 import type { DeckStatus } from './api.js';
@@ -136,15 +140,50 @@ async function main() {
       if (checks.some((c) => c.status === 'fail')) process.exitCode = 1;
       return;
     }
+    case 'keychain': {
+      // smartdeck-mac keychain set <name>   (secret read from a hidden prompt or piped stdin)
+      // smartdeck-mac keychain remove <name> | migrate   (migrate moves plain-text secrets out of the config)
+      const kc = new Keychain(securityRunner);
+      const [sub, name] = rest;
+      if (sub === 'set' && name) {
+        await kc.set(name, await readSecret(`Secret for "${name}": `));
+        console.log(`Stored in the Keychain. Use "keychain:${name}" in the config.`);
+      } else if (sub === 'remove' && name) {
+        await kc.remove(name);
+        console.log(`Removed "${name}".`);
+      } else if (sub === 'migrate') {
+        const file = configPath();
+        const raw = JSON.parse(readFileSync(file, 'utf8'));
+        const { config, moved } = await migrateSecrets(raw, kc);
+        if (!moved.length) { console.log('Nothing to migrate: no plain-text secrets in the config.'); return; }
+        const tmp = file + '.tmp';
+        writeFileSync(tmp, JSON.stringify(config, null, 2) + '\n', { mode: 0o600 });
+        renameSync(tmp, file);
+        console.log(`Moved ${moved.length} secret(s) to the Keychain: ${moved.join(', ')}.\nRestart the service so it re-reads the config: launchctl kickstart -k gui/$(id -u)/com.smartdeck.mac`);
+      } else {
+        throw new Error('usage: smartdeck-mac keychain set <name> | remove <name> | migrate');
+      }
+      return;
+    }
+    case 'install-menubar': {
+      const cliPath = fileURLToPath(import.meta.url);
+      if (!cliPath.endsWith('.js')) throw new Error('Run `npm run build` first and use `node dist/cli.js install-menubar` (the plugin needs the compiled CLI).');
+      const dir = await findSwiftbarPluginDir(async (f, a) => defaultCapture(f, a));
+      if (!dir) throw new Error('SwiftBar/xbar plugin folder not found. Install SwiftBar (brew install --cask swiftbar), run it once, then retry.');
+      const file = installSwiftbarPlugin(dir, swiftbarPluginSource({ nodePath: process.execPath, cliPath }));
+      console.log(`Installed ${file}. SwiftBar will pick it up within a few seconds.`);
+      return;
+    }
     case 'status': {
       // smartdeck-mac status [--short]   (used by the menu-bar plugin)
       try {
         const st = await daemonStatus();
         const extra = [st.link === 'wifi' ? 'WiFi' : st.link === 'usb' ? 'USB' : '', st.net?.ble && st.net.ble !== 'off' ? `BT ${st.net.ble}` : ''].filter(Boolean).join(' · ');
-        console.log(st.connected ? `${st.deviceName ?? 'Deck'}${extra ? ' · ' + extra : ''} · page ${st.page + 1}` : 'Deck not connected');
+        const line = st.connected ? `${st.deviceName ?? 'Deck'}${extra ? ' · ' + extra : ''} · page ${st.page + 1}` : 'Deck not connected';
+        console.log(rest.includes('--short') ? (st.connected ? '● ' : '○ ') + line : line);
         if (!st.connected) process.exitCode = 2;
       } catch (e) {
-        console.log('SmartDeck not running');
+        console.log(rest.includes('--short') ? '○ SmartDeck not running' : 'SmartDeck not running');
         process.exitCode = 3;
       }
       return;
@@ -199,7 +238,7 @@ async function main() {
       return;
     }
     default:
-      console.log('usage: smartdeck-mac [run|open|init|ports|sync|flash|ota|alert|provision|virtual|doctor|status|install-service] [--port /dev/cu.usbmodemXXXX]');
+      console.log('usage: smartdeck-mac [run|open|init|ports|sync|flash|ota|alert|provision|virtual|doctor|status|keychain|install-menubar|install-service] [--port /dev/cu.usbmodemXXXX]');
       process.exitCode = 1;
   }
 }
