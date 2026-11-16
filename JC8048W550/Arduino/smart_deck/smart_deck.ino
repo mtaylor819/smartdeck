@@ -76,6 +76,21 @@ bool weather_is_celsius = true;     // Temperature unit (true=C, false=F)
 char weather_description[32] = "";  // Weather description from app (translated)
 char weather_city[32] = "";         // City name from app
 
+/* --- Optional LCARS "starship diagnostics" sleep screen (SET_SLEEP_SCREEN / DIAG) --- */
+bool sleep_screen_diag = false;       // false = classic clock/weather (default)
+bool diag_have = false;               // received at least one DIAG line
+unsigned long diag_stamp_ms = 0;      // millis() of last DIAG line
+unsigned long diag_last_draw_ms = 0;  // millis() of last diagnostics repaint
+bool diag_frame_drawn = false;        // static frame currently on screen?
+bool diag_drawn_valid = false;        // dynamic cache below valid?
+int diag_cpu = 0, diag_mem = 0, diag_disk = 0;
+unsigned long diag_rx = 0, diag_tx = 0, diag_uptime_min = 0;
+char diag_host[17] = "";
+int dr_cpu, dr_mem, dr_disk, dr_net;   // last drawn gauge percentages
+unsigned long dr_rx, dr_tx, dr_up;     // last drawn values
+int dr_hour, dr_min;
+char dr_host[17];
+
 /* --- Deep Sleep Mode (screen & LED off) --- */
 bool deep_sleep_enabled = false;                       // Is deep sleep enabled?
 unsigned long deep_sleep_timeout_ms = 30 * 60 * 1000;  // Default 30 min after dim
@@ -298,6 +313,7 @@ void update_activity() {
     strip.show();
 
     // Restore screen
+    diag_frame_drawn = false;
     gfx->fillScreen(BLACK);
     set_brightness(current_brightness);
     draw_page(current_page);
@@ -311,6 +327,7 @@ void update_activity() {
     dim_start_time = 0;  // Reset dim timer
     // CRITICAL FIX: First clear screen, then restore brightness, then draw page
     // This prevents the sleep clock from flashing briefly
+    diag_frame_drawn = false;
     gfx->fillScreen(BLACK);
     set_brightness(current_brightness);
     draw_page(current_page);
@@ -332,6 +349,7 @@ void check_sleep_mode() {
 #ifdef GFX_BL
       ledcWrite(BL_PWM_CHANNEL, 0);
 #endif
+      diag_frame_drawn = false;
       gfx->fillScreen(BLACK);
 
       // Turn off LEDs
@@ -428,7 +446,8 @@ void check_sleep_mode() {
     ledcWrite(BL_PWM_CHANNEL, 80);
 #endif
 
-    // Clear screen and draw clock
+    // Clear screen and draw clock (or diagnostics screen)
+    diag_frame_drawn = false;
     gfx->fillScreen(BLACK);
     draw_sleep_clock();
   }
@@ -636,7 +655,176 @@ uint8_t sin8(uint8_t theta) {
 }
 
 
-void draw_sleep_clock() {
+// ============================================================================
+// LCARS DIAGNOSTICS SLEEP SCREEN (optional, selected with SET_SLEEP_SCREEN:diag)
+// Layout is 800x480. The static frame is painted once; updates only repaint
+// the regions whose values changed (no fillScreen => no flicker).
+// ============================================================================
+#define C565(r, g, b) ((uint16_t)((((r) & 0xF8) << 8) | (((g) & 0xFC) << 3) | ((b) >> 3)))
+#define LC_ORANGE C565(0xFF, 0x99, 0x00)
+#define LC_PEACH  C565(0xFF, 0x99, 0x66)
+#define LC_TAN    C565(0xFF, 0xCC, 0x99)
+#define LC_LILAC  C565(0xCC, 0x99, 0xCC)
+#define LC_VIOLET C565(0x99, 0x99, 0xCC)
+#define LC_BLUE   C565(0x99, 0xCC, 0xFF)
+#define LC_SALMON C565(0xCC, 0x66, 0x66)
+#define LC_GOLD   C565(0xFF, 0xCC, 0x66)
+#define LC_RED    C565(0xFF, 0x40, 0x40)
+
+#define DIAG_STALE_MS 120000UL
+#define DIAG_X 130          // content area left edge
+#define DIAG_W 660          // content area width
+#define DIAG_ROW_Y0 92      // first gauge row top
+#define DIAG_ROW_H 74       // gauge row pitch
+#define DIAG_BAR_DY 24      // bar top relative to row top
+#define DIAG_BAR_H 30
+
+static bool diag_active() {
+  return sleep_screen_diag && diag_have && (millis() - diag_stamp_ms) < DIAG_STALE_MS;
+}
+
+static uint16_t diag_gauge_color(int pct) {
+  if (pct >= 85) return LC_RED;
+  if (pct >= 60) return LC_GOLD;
+  return LC_ORANGE;
+}
+
+// Network gauge: log scale, 0..100000 KB/s => 0..100 %.
+static int diag_net_pct(unsigned long kbps) {
+  if (kbps == 0) return 0;
+  int pct = (int)(100.0f * log10f(1.0f + (float)kbps) / 5.0f);
+  return pct > 100 ? 100 : pct;
+}
+
+static const char* const DIAG_LABELS[4] = { "CORE LOAD", "MEMORY", "STORAGE", "SUBSPACE LINK" };
+
+static void diag_draw_static() {
+  // Elbow: rounded orange block with a square notch cut out => rail + top bar.
+  gfx->fillRoundRect(0, 0, 180, 110, 55, LC_ORANGE);  // only the top-left corner stays round:
+  gfx->fillRect(0, 55, 110, 55, LC_ORANGE);           //   square the rail's lower-left corner
+  gfx->fillRect(110, 0, 70, 44, LC_ORANGE);           //   square the top bar's right end
+  gfx->fillRect(110, 44, 70, 66, BLACK);              //   cut the notch between rail and bar
+  // Title bar
+  gfx->fillRoundRect(184, 0, 616, 44, 22, LC_ORANGE);
+  gfx->setTextSize(3);
+  gfx->setTextColor(BLACK);
+  gfx->setCursor(210, 10);
+  gfx->print("SMARTDECK  SYSTEM DIAGNOSTICS");
+  // Left rail
+  gfx->fillRect(0, 114, 110, 56, LC_SALMON);
+  gfx->fillRect(0, 174, 110, 110, LC_VIOLET);
+  gfx->fillRect(0, 288, 110, 56, LC_BLUE);
+  gfx->fillRect(0, 348, 110, 48, LC_TAN);
+  gfx->fillRoundRect(0, 400, 110, 80, 20, LC_LILAC);
+  gfx->fillRect(0, 400, 110, 30, LC_LILAC);  // square the top corners again
+  // Gauge labels + empty bar outlines
+  gfx->setTextSize(2);
+  gfx->setTextColor(LC_TAN);
+  for (int i = 0; i < 4; i++) {
+    int y0 = DIAG_ROW_Y0 + i * DIAG_ROW_H;
+    gfx->setCursor(DIAG_X, y0);
+    gfx->print(DIAG_LABELS[i]);
+    gfx->drawRect(DIAG_X, y0 + DIAG_BAR_DY, DIAG_W, DIAG_BAR_H, LC_VIOLET);
+  }
+  // Bottom decorative bar
+  gfx->fillRoundRect(DIAG_X, 466, DIAG_W, 10, 5, LC_VIOLET);
+}
+
+// One gauge row: value text (right of the label) + bar fill. Only changed parts repaint.
+static void diag_draw_gauge(int row, int pct, const char* valueText, bool valueChanged, int lastPct) {
+  int y0 = DIAG_ROW_Y0 + row * DIAG_ROW_H;
+  if (valueChanged) {
+    gfx->fillRect(330, y0, 460, 18, BLACK);
+    gfx->setTextSize(2);
+    gfx->setTextColor(0xFFFF);
+    gfx->setCursor(330, y0);
+    gfx->print(valueText);
+  }
+  if (pct != lastPct || lastPct < 0) {
+    int innerW = DIAG_W - 4;
+    int fill = (innerW * pct) / 100;
+    int by = y0 + DIAG_BAR_DY + 2;
+    if (fill > 0) gfx->fillRect(DIAG_X + 2, by, fill, DIAG_BAR_H - 4, diag_gauge_color(pct));
+    if (fill < innerW) gfx->fillRect(DIAG_X + 2 + fill, by, innerW - fill, DIAG_BAR_H - 4, BLACK);
+  }
+}
+
+static void diag_draw_dynamic() {
+  bool all = !diag_drawn_valid;
+  char buf[40];
+  int cpu = diag_cpu, mem = diag_mem, disk = diag_disk;
+  int net = diag_net_pct(diag_rx > diag_tx ? diag_rx : diag_tx);
+
+  if (all || cpu != dr_cpu) {
+    snprintf(buf, sizeof(buf), "%d%%", cpu);
+    diag_draw_gauge(0, cpu, buf, true, all ? -1 : dr_cpu);
+    dr_cpu = cpu;
+  }
+  if (all || mem != dr_mem) {
+    snprintf(buf, sizeof(buf), "%d%%", mem);
+    diag_draw_gauge(1, mem, buf, true, all ? -1 : dr_mem);
+    dr_mem = mem;
+  }
+  if (all || disk != dr_disk) {
+    snprintf(buf, sizeof(buf), "%d%%", disk);
+    diag_draw_gauge(2, disk, buf, true, all ? -1 : dr_disk);
+    dr_disk = disk;
+  }
+  if (all || diag_rx != dr_rx || diag_tx != dr_tx || net != dr_net) {
+    snprintf(buf, sizeof(buf), "RX %lu  TX %lu KB/S", diag_rx, diag_tx);
+    diag_draw_gauge(3, net, buf, true, all ? -1 : dr_net);
+    dr_rx = diag_rx;
+    dr_tx = diag_tx;
+    dr_net = net;
+  }
+  // Host name under the title bar
+  if (all || strcmp(diag_host, dr_host) != 0) {
+    gfx->fillRect(190, 52, 400, 18, BLACK);
+    gfx->setTextSize(2);
+    gfx->setTextColor(LC_TAN);
+    gfx->setCursor(200, 54);
+    gfx->print(diag_host);
+    strcpy(dr_host, diag_host);
+  }
+  // Uptime
+  if (all || diag_uptime_min != dr_up) {
+    unsigned long d = diag_uptime_min / 1440UL, h = (diag_uptime_min / 60UL) % 24UL, m = diag_uptime_min % 60UL;
+    if (d > 0) snprintf(buf, sizeof(buf), "UPTIME %luD %02lu:%02lu", d, h, m);
+    else snprintf(buf, sizeof(buf), "UPTIME %02lu:%02lu", h, m);
+    gfx->fillRect(DIAG_X, 396, 460, 26, BLACK);
+    gfx->setTextSize(3);
+    gfx->setTextColor(LC_BLUE);
+    gfx->setCursor(DIAG_X, 398);
+    gfx->print(buf);
+    dr_up = diag_uptime_min;
+  }
+  // Clock HH:MM (from the time the PC sent us)
+  if (all || current_hour != dr_hour || current_minute != dr_min) {
+    snprintf(buf, sizeof(buf), "%02d:%02d", current_hour, current_minute);
+    gfx->fillRect(600, 386, 196, 56, BLACK);
+    gfx->setTextSize(6);
+    gfx->setTextColor(LC_ORANGE);
+    gfx->setCursor(610, 390);
+    gfx->print(buf);
+    dr_hour = current_hour;
+    dr_min = current_minute;
+  }
+  gfx->setTextSize(2);  // Reset
+  diag_drawn_valid = true;
+}
+
+static void diag_draw() {
+  if (!diag_frame_drawn) {
+    gfx->fillScreen(BLACK);
+    diag_draw_static();
+    diag_frame_drawn = true;
+    diag_drawn_valid = false;
+  }
+  diag_draw_dynamic();
+  diag_last_draw_ms = millis();
+}
+
+void draw_sleep_clock_classic() {
   // Clear screen to prevent text overlap
   gfx->fillScreen(BLACK);
 
@@ -731,6 +919,17 @@ void draw_sleep_clock() {
   }
 
   gfx->setTextSize(2);  // Reset
+}
+
+// Sleep screen entry point used by all existing call sites: diagnostics when selected and
+// fresh DIAG data is available, otherwise the original clock/weather screen.
+void draw_sleep_clock() {
+  if (diag_active()) {
+    diag_draw();
+    return;
+  }
+  diag_frame_drawn = false;
+  draw_sleep_clock_classic();
 }
 
 // Get weather description from WMO code
@@ -1784,6 +1983,7 @@ void setup() {
   led_brightness = preferences.getInt("led_br", 255);
   current_brightness = preferences.getInt("bright", 100);
   sleep_enabled = preferences.getBool("sleep_on", true);
+  sleep_screen_diag = preferences.getBool("sleep_diag", false);
   int sleep_min = preferences.getInt("sleep_min", 5);
   sleep_timeout_ms = (unsigned long)sleep_min * 60 * 1000;
 
@@ -2270,6 +2470,48 @@ void loop() {
         }
       }
 
+      // --- Diagnostics sleep screen: choose screen. Format: SET_SLEEP_SCREEN:clock|diag ---
+      else if (command.startsWith("SET_SLEEP_SCREEN:")) {
+        String mode = command.substring(17);
+        mode.trim();
+        if (mode == "diag" || mode == "clock") {
+          sleep_screen_diag = (mode == "diag");
+          preferences.putBool("sleep_diag", sleep_screen_diag);
+          Serial.printf("SLEEP_SCREEN_SET:%s\n", mode.c_str());
+          if (is_sleeping && !is_deep_sleeping) {
+            diag_frame_drawn = false;
+            draw_sleep_clock();
+          }
+        } else {
+          Serial.println("ERR_SLEEP_SCREEN");
+        }
+      }
+
+      // --- Diagnostics data. Format: DIAG:cpu:mem:disk:rxKBs:txKBs:uptimeMin:host ---
+      // Handled here (not via the generic fallthrough) so it never wakes a sleeping deck.
+      else if (command.startsWith("DIAG:")) {
+        int c = 0, m = 0, d = 0;
+        unsigned long rx = 0, tx = 0, up = 0;
+        char host[17] = "";
+        int n = sscanf(command.c_str() + 5, "%d:%d:%d:%lu:%lu:%lu:%16[^:\r\n]", &c, &m, &d, &rx, &tx, &up, host);
+        if (n >= 6) {
+          diag_cpu = constrain(c, 0, 100);
+          diag_mem = constrain(m, 0, 100);
+          diag_disk = constrain(d, 0, 100);
+          diag_rx = rx;
+          diag_tx = tx;
+          diag_uptime_min = up;
+          strncpy(diag_host, n >= 7 ? host : "", sizeof(diag_host) - 1);
+          diag_host[sizeof(diag_host) - 1] = '\0';
+          diag_have = true;
+          diag_stamp_ms = millis();
+          if (is_sleeping && !is_deep_sleeping && sleep_screen_diag &&
+              (!diag_frame_drawn || millis() - diag_last_draw_ms >= 2000)) {
+            draw_sleep_clock();
+          }
+        }
+      }
+
       // --- Other Commands ---
       else if (command.equals("PING_DECK")) {
         Serial.print("PONG_DECK:");
@@ -2308,7 +2550,8 @@ void loop() {
           }
         }
         update_activity();
-      } else if (!command.startsWith("SET_TIME:")) {
+      } else if (!command.startsWith("SET_TIME:") && !command.startsWith("SET_BTN_DATA:")) {
+        // SET_BTN_DATA is a background host update (live widgets): it must not wake a sleeping deck.
         update_activity();
       }
     }
@@ -2637,8 +2880,8 @@ void loop() {
             // 3. Save to SD Card (persistent across restarts)
             saveConfigToSD();
 
-            // 4. If current page is affected, redraw completely
-            if (page == current_page) {
+            // 4. If current page is affected, redraw completely (not while asleep: waking redraws the page)
+            if (page == current_page && !is_sleeping && !is_deep_sleeping) {
               draw_page(current_page);
               Serial.println("BTN_UPDATED_AND_PAGE_REDRAWN");
             }
@@ -2679,6 +2922,7 @@ void loop() {
 
         // If sleeping, update clock display
         if (is_sleeping) {
+          diag_frame_drawn = false;
           gfx->fillScreen(BLACK);
           draw_sleep_clock();
         }

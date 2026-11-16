@@ -49,3 +49,24 @@ esptool. Press RESET afterwards. Stop the `smartdeck-mac` daemon first, since it
 Flashing does not touch the SD card, so the layout and icons survive.
 
 Verify with `shasum -a 256 -c dist/smartdeck-jc8048w550-merged.bin.sha256`.
+
+## Optional: LCARS diagnostics sleep screen
+
+Added to `smart_deck.ino` (compile-verified only; **not yet seen on real hardware**). Default behaviour is unchanged.
+
+| Command | Effect |
+|---|---|
+| `SET_SLEEP_SCREEN:diag` / `SET_SLEEP_SCREEN:clock` | choose the sleep screen (stored in Preferences key `sleep_diag`); replies `SLEEP_SCREEN_SET:<mode>` |
+| `DIAG:cpu:mem:disk:rxKBs:txKBs:uptimeMin:host` | host metrics (percent ints, KB/s, minutes, name <=16 chars). Does **not** wake the deck. |
+
+While asleep in `diag` mode with DIAG data newer than 120 s, the deck shows gauges (core load, memory, storage, subspace link),
+uptime and a clock; otherwise it falls back to the classic clock/weather screen. Repaints are limited to ~every 2 s and only
+touch changed regions. Waking redraws the normal page as before. Binary size grew by ~19 KB (app 545,881 bytes, 17% of the 3 MB partition).
+
+## Patches to the stock firmware
+
+- **Widget updates no longer wake a sleeping deck.** In the stock sketch every serial command that isn't explicitly handled counts as
+  activity (`update_activity()`), and `SET_BTN_DATA` redraws the page immediately. Live widgets on the Mac send `SET_BTN_DATA`
+  periodically, which would keep the deck awake forever. `SET_BTN_DATA` is now excluded from the wake path and skips the redraw while
+  the deck is dimmed/deep-sleeping (waking redraws the page from the stored config anyway).
+- **Diagnostics sleep screen** (`SET_SLEEP_SCREEN` / `DIAG`), described above.
