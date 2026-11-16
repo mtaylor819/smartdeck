@@ -76,8 +76,11 @@ function layout(cfg) {
 
 function fmtTimer(sec) { return `${pad2(Math.floor(sec / 60))}:${pad2(sec % 60)}`; }
 
-function drawButton(c, s, cell, b, isPressed) {
+function drawButton(c, s, cell, b0, isPressed) {
   const th = s.config.theme || {};
+  // SET_BTN_LIVE / on-deck Home Assistant state: RAM-only overrides of how the button is drawn
+  const live = s.live && s.live[`${s.page}:${cell.i}`];
+  const b = live ? { ...b0, ...live } : b0;
   const btnCol = hex(b.btnColor, hex(th.btn_color, '#333333'));
   const stroke = isPressed ? '#ffffff' : hex(th.stroke_color, '#555555');
   const key = `${s.page}:${cell.i}`;
@@ -254,6 +257,19 @@ function drawAlert(c, s, t) {
   c.restore();
 }
 
+// ---------------------------------------------------------------- toast (e.g. "BT: Work PC")
+function drawToast(c, s) {
+  const t = s.toast; if (!t || s.now >= t.until) return;
+  c.save();
+  c.font = 'bold 26px "Helvetica Neue",Arial,sans-serif';
+  // over the (non-interactive) title strip so it never hides a button
+  const w = Math.min(W - 80, c.measureText(t.text).width + 56), h = 40, x = (W - w) / 2, y = 5;
+  fillRR(c, x, y, w, h, 24, 'rgba(0,0,0,0.88)');
+  c.lineWidth = 3; c.strokeStyle = B; rr(c, x, y, w, h, 24); c.stroke();
+  c.fillStyle = B; c.textAlign = 'center'; c.textBaseline = 'middle'; c.fillText(t.text, W / 2, y + h / 2 + 1, w - 30);
+  c.restore();
+}
+
 // ---------------------------------------------------------------- LED ring
 function hsv(h, sv = 1, v = 1) {
   const i = Math.floor(h * 6) % 6, f = h * 6 - Math.floor(h * 6), p = v * (1 - sv), q = v * (1 - f * sv), u = v * (1 - (1 - f) * sv);
@@ -320,6 +336,7 @@ function frame(t) {
     else if (s.sleep.sleeping || s.sleep.deepSleeping) drawSleep(ctx, s, t);
     else drawMain(ctx, s);
     if (!s.rebooting && !s.sleep.deepSleeping) drawAlert(ctx, s, t);
+    if (!s.rebooting && !s.sleep.sleeping && !s.sleep.deepSleeping) drawToast(ctx, s);
     let b = Math.max(0.06, s.effectiveBrightness / 100);
     if (s.sleep.sleeping) b *= 0.55; // the firmware dims the backlight while the sleep screen is shown
     screen.style.filter = s.sleep.deepSleeping || s.rebooting ? 'brightness(0)' : `brightness(${b.toFixed(2)})`;
@@ -396,6 +413,11 @@ function setStatus(rows) {
     dl.append(dt, dd);
   }
 }
+function haPollText(s) {
+  const e = Object.entries(s.haState || {});
+  if (!e.length) return s.net.hasHaToken && s.net.hasHaUrl ? 'idle' : 'not configured';
+  return e.slice(0, 3).map(([k, v]) => `${k}: ${v.state} (${Math.max(0, Math.round((s.now - v.at) / 1000))}s ago)`).join(' · ');
+}
 function updatePanel() {
   const s = snap, n = s.net.status;
   const host = $('hostChip');
@@ -414,6 +436,10 @@ function updatePanel() {
     ['WiFi', n.wifi === 'connected' ? `${n.ssid} · ${n.ip} · ${n.rssi} dBm` : 'off', n.wifi === 'connected' ? 'good' : ''],
     ['Host name', `${n.host}.local`],
     ['BLE', n.ble === 'connected' ? `connected: ${n.ble_peer}` : n.ble, n.ble === 'connected' ? 'good' : ''],
+    ['BLE slot', `${n.ble_slot} · ${n.ble_slots[n.ble_slot - 1]}${s.ble.bonds[n.ble_slot - 1] ? ' · bonded' : ''}`],
+    ['Caps', (n.caps || []).join(', ') || 'none'],
+    ['Live buttons', Object.keys(s.live || {}).length ? `${Object.keys(s.live).length} overridden (RAM only)` : 'none'],
+    ['HA poll', haPollText(s)],
     ['Standalone', `${s.net.standalone}${s.net.hasHaToken ? ' · HA token set' : ''}`],
     ['Autodim', s.autodim.sensor ? `${s.autodim.enabled ? 'on' : 'off'} · ${s.autodim.min}–${s.autodim.max}% · ${s.autodim.lux} lux` : 'no sensor', s.autodim.sensor ? '' : 'bad'],
     ['Gestures', `swipe ${s.gestures.swipe ? 'on' : 'off'} · hold ${s.gestures.holdMs} ms`],
@@ -424,6 +450,11 @@ function updatePanel() {
   $('ackBtn').hidden = !s.alert;
   $('bleBtn').hidden = !s.ble.enabled;
   $('bleBtn').textContent = s.ble.peer ? 'Disconnect BLE' : 'Simulate BLE connect';
+  $('slotRow').hidden = !s.ble.enabled;
+  document.querySelectorAll('#slotRow button[data-slot]').forEach((btn) => {
+    const n = Number(btn.dataset.slot);
+    if (n) { btn.textContent = `${n}: ${s.ble.slots[n - 1]}${s.ble.bonds[n - 1] ? ' ●' : ''}`; btn.classList.toggle('active', n === s.ble.slot); }
+  });
   $('luxRow').hidden = !s.autodim.sensor;
   if (document.activeElement !== $('lux')) { $('lux').value = s.autodim.lux; $('luxOut').textContent = `${s.autodim.lux} lux`; }
   $('footRight').textContent = s.clock.set ? `${pad2(k.h)}:${pad2(k.m)}` : '';
@@ -434,6 +465,8 @@ $('wakeBtn').addEventListener('click', () => post('/api/wake').then(poll));
 $('sleepBtn').addEventListener('click', () => post('/api/sleep').then(poll));
 $('ackBtn').addEventListener('click', () => post('/api/ack').then(poll));
 $('bleBtn').addEventListener('click', () => post('/api/ble', { peer: snap && snap.ble.peer ? '' : 'MacBook Pro' }).then(poll));
+document.querySelectorAll('#slotRow button[data-slot]').forEach((btn) =>
+  btn.addEventListener('click', () => post('/api/ble-slot', { slot: btn.dataset.slot === 'next' ? 'next' : Number(btn.dataset.slot) }).then(poll)));
 $('lux').addEventListener('input', (e) => { $('luxOut').textContent = `${e.target.value} lux`; post('/api/lux', { lux: Number(e.target.value) }); });
 
 poll();
