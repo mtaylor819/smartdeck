@@ -109,12 +109,17 @@ function drawButton(c, s, cell, b0, isPressed) {
     const left = t ? Math.max(0, t.duration - Math.floor((s.now - t.startedAt) / 1000)) : Number(b.duration || 0);
     label = fmtTimer(left); big = true;
   }
+  // Faithful to the real firmware: normal buttons draw NO label text when they have an icon (the Windows app bakes labels
+  // into the icon). Text appears for timers/counters, live labels, icon-less buttons, and buttons that set showLabel.
+  const isTC = b.type === 'counter' || b.type === 'timer';
+  const hasLiveLabel = !!(live && live.label !== undefined);
+  if (!isTC && im && !hasLiveLabel && !b0.showLabel) label = '';
   if (label) {
     const px = big ? 30 : Math.max(8, Math.min(40, Number(b.labelSize) || 18));
     c.font = `bold ${px}px "Helvetica Neue",Arial,sans-serif`;
-    c.textAlign = 'center'; c.textBaseline = im || !big ? 'alphabetic' : 'middle';
+    c.textAlign = 'center'; c.textBaseline = im ? 'alphabetic' : 'middle';
     c.fillStyle = hex(b.labelColor, hex(th.text_color, '#ffffff'));
-    const cy = big && !im ? cell.y + cell.h / 2 : cell.y + cell.h - 10;
+    const cy = im ? cell.y + cell.h - 10 : cell.y + cell.h / 2;  // icon: label along the bottom; no icon: centred
     c.save(); rr(c, cell.x, cell.y, cell.w, cell.h, RADIUS); c.clip();
     c.fillText(label, cell.x + cell.w / 2, cy, cell.w - 10); c.restore();
   }
