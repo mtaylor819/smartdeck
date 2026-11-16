@@ -92,3 +92,8 @@ test('validation: ble slots, haState and blehost', () => {
   b.pages[0].buttons[0] = { label: 'x', action: { type: 'blehost', slot: 3 }, haState: { entity: 'light.desk', on: '00ff00', interval: 5 } };
   validate(b);
 });
+
+test('buttons with a label ask the firmware to draw it (stock firmware draws none)', () => {
+  assert.equal(toDeviceButton({ label: 'Mute', icon: 'm.jpg', action: { type: 'media', key: 'mute' } })!.showLabel, true);
+  assert.equal('showLabel' in toDeviceButton({ action: { type: 'none' } })!, false);
+});

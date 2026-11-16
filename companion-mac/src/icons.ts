@@ -70,10 +70,11 @@ export async function saveIconifyIcon(
   if (!res.ok) throw new Error(`iconify returned ${res.status}`);
   const svg = Buffer.from(await res.arrayBuffer());
   if (svg.length > 500_000) throw new Error('icon too large');
-  // Render the (80px tall) SVG centred on a square background.
-  const glyph = await sharp(svg, { density: 300 }).resize(80, 80, { fit: 'inside' }).png().toBuffer();
+  // The deck draws the button label along the bottom edge, so keep the glyph in the upper part of the tile.
+  const GLYPH = 64;
+  const glyph = await sharp(svg, { density: 300 }).resize(GLYPH, GLYPH, { fit: 'inside' }).png().toBuffer();
   const canvas = await sharp({ create: { width: ICON_SIZE, height: ICON_SIZE, channels: 3, background: bg(opts.bg) } })
-    .composite([{ input: glyph, gravity: 'centre' }])
+    .composite([{ input: glyph, left: Math.round((ICON_SIZE - GLYPH) / 2), top: 10 }])
     .jpeg({ quality: 90 })
     .toBuffer();
   const file = safeIconName(opts.name || `${set}-${icon}`);

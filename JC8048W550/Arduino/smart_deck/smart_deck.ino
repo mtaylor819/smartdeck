@@ -1639,6 +1639,7 @@ void draw_single_button(int btn_index) {
 
   // 4. Text Drawing
   const char* label_text = button_cfg["label"];
+  bool label_bottom = false;  // [showLabel] true => label sits at the bottom edge, over/under an icon
   int label_size_px = button_cfg["labelSize"] | 18;
   char time_str[10];
   char counter_str[32];
@@ -1672,6 +1673,8 @@ void draw_single_button(int btn_index) {
 #if LIVE_LABEL_FALLBACK
     else if (fileToDraw.length() <= 1) label_text = button_cfg["label"];
 #endif
+    // [showLabel] Mac-app buttons: draw the label even when an icon is present (along the bottom edge, see below).
+    if (!label_text && (button_cfg["showLabel"] | false)) { label_text = button_cfg["label"]; label_bottom = true; }
   }
   if (live_ov && (live_ov->flags & LIVE_F_SIZE)) label_size_px = live_ov->labelSize;  // [live]
 
@@ -1717,6 +1720,7 @@ void draw_single_button(int btn_index) {
     gfx->getTextBounds(label_text, 0, 0, &tx, &ty, &tw, &th);
     int text_x = x_pos + (CELL_W - tw) / 2;
     int text_y = y_pos + (CELL_H - th) / 2;
+    if (label_bottom) text_y = y_pos + CELL_H - th - 8;  // [showLabel]
     gfx->setCursor(text_x, text_y);
     gfx->print(label_text);
   }

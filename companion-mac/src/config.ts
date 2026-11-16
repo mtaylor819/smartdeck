@@ -224,6 +224,8 @@ export function toDeviceButton(b: Button | null): Record<string, unknown> | null
   if (b.labelColor !== undefined) out.labelColor = b.labelColor;
   if (b.btnColor !== undefined) out.btnColor = b.btnColor;
   if (b.icon !== undefined) out.icon = b.icon;
+  // The stock firmware draws no label text on buttons (the Windows app bakes it into the icon). Ours asks for it.
+  if (b.label) out.showLabel = true;
   if (b.hold) out.hold = true;
   if (b.haState) out.ha_state = b.haState;
   const a = b.action;

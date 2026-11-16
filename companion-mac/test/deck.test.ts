@@ -92,9 +92,9 @@ test('device config JSON strips host-only fields and keeps firmware fields', () 
   const cfg = defaultConfig();
   const dev = toDeviceConfig(cfg) as any;
   assert.equal(dev.grid.cols, 4);
-  assert.deepEqual(dev.pages[0].buttons[0], { label: 'Chrome', type: 'app' });
-  assert.deepEqual(dev.pages[0].buttons[7], { label: 'Screenshot', type: 'key', combo: 'cmd+shift+4' });
-  assert.deepEqual(dev.pages[0].buttons[11], { label: 'Page 2', type: 'goto', page: 2 });
+  assert.deepEqual(dev.pages[0].buttons[0], { label: 'Chrome', showLabel: true, type: 'app' });
+  assert.deepEqual(dev.pages[0].buttons[7], { label: 'Screenshot', showLabel: true, type: 'key', combo: 'cmd+shift+4' });
+  assert.deepEqual(dev.pages[0].buttons[11], { label: 'Page 2', showLabel: true, type: 'goto', page: 2 });
   assert.equal(JSON.stringify(dev).includes('github.com'), false); // URLs stay on the Mac
   assert.equal(toDeviceButton(null), null);
 });

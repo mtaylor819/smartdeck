@@ -38,7 +38,7 @@ test('hold buttons run their hold action; BTN_HOLD without hold is ignored; hold
   new Deck(t, cfg, new ActionExecutor(run), () => {});
   t.deck('BTN_HOLD:0:0'); t.deck('BTN_HOLD:0:1'); await tick();
   assert.deepEqual(calls, [['open', '-a', 'Terminal']]);
-  assert.deepEqual(toDeviceButton(cfg.pages[0].buttons[0]), { label: 'x', hold: true, type: 'app' });
+  assert.deepEqual(toDeviceButton(cfg.pages[0].buttons[0]), { label: 'x', showLabel: true, hold: true, type: 'app' });
 });
 
 test('device JSON carries media / ha / http fields for standalone use', () => {
