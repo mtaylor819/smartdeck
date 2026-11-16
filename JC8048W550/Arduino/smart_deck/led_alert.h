@@ -18,6 +18,7 @@
 
 static bool alert_on = false;
 static bool alert_swallow_touch = false;  // after an ack, ignore the finger until it lifts (so it can't press a button)
+static bool alert_armed = false;          // M1: only a touch that BEGAN after the alert appeared may acknowledge it (armed by a finger-up poll)
 static char alert_kind = 'r';             // 'r' red, 'y' yellow, 'b' blue, 'g' green
 static bool alert_flash = true;           // banner phase (red alternates bright/dark)
 static unsigned long alert_start_ms = 0;
@@ -78,6 +79,7 @@ static void alert_clear(bool redraw) {
 
 static void alert_start(char kind, long seconds, const char* text) {
   alert_on = true;
+  alert_armed = false;  // a finger that is already down must not acknowledge (or press anything): wait for a lift first
   alert_kind = kind;
   alert_flash = true;
   alert_start_ms = millis();
@@ -130,8 +132,11 @@ bool alert_command(const String& c) {
   String secStr = i2 < 0 ? rest : rest.substring(0, i2);
   String txtStr = i2 < 0 ? "" : rest.substring(i2 + 1);
   secStr.trim();
+  // L2: digits only. toInt() turns garbage ("abc", "12x") into 0 = "until acknowledged", i.e. a never-expiring alert from a typo.
+  bool secDigits = secStr.length() <= 4;
+  for (unsigned int k = 0; secDigits && k < secStr.length(); k++) if (secStr[k] < '0' || secStr[k] > '9') secDigits = false;
   long seconds = secStr.length() ? secStr.toInt() : 0;
-  if (seconds < 0 || seconds > 3600) {
+  if (!secDigits || seconds < 0 || seconds > 3600) {
     Serial.println("ALERT:err:seconds");
     return true;
   }
@@ -192,8 +197,15 @@ bool alert_render_ring() {
 
 // Touch hook (called every touch poll with the debounced "finger is down" state).
 // Returns true while the touch must be swallowed: the touch that acknowledges an alert, and the rest of that same press.
+bool alert_is_active() { return alert_on; }  // used by ble_hid.h's pairing indicator (declared there; this header is included later)
+
 bool alert_touch_ack(bool touched) {
-  if (alert_on && touched) {
+  if (alert_on) {
+    if (!touched) {
+      alert_armed = true;  // finger is up: the NEXT touch is a deliberate one and may acknowledge
+      return false;
+    }
+    if (!alert_armed) return true;  // M1: the touch began before the alert: swallow it, do not acknowledge, do not press the button under it
     Serial.printf("ALERT_ACK:%s\n", alert_kind_name(alert_kind));
     alert_clear(true);
     alert_swallow_touch = true;

@@ -164,7 +164,8 @@ static void diaganim_frame(uint32_t now) {
   }
 
   // 1. Scan segment sweeping back and forth along the bottom bar (only the swept delta is repainted)
-  uint32_t t = (now * 220UL / 1000UL) % (2UL * DA_BAR_RANGE);
+  // L4: now*220 overflows 32 bits every ~5.4 h (the segment jumped once per wrap): widen before multiplying.
+  uint32_t t = (uint32_t)(((uint64_t)now * 220ULL / 1000ULL) % (2ULL * DA_BAR_RANGE));
   int off = (t < (uint32_t)DA_BAR_RANGE) ? (int)t : (int)(2UL * DA_BAR_RANGE - t);
   int pos = DA_BAR_X0 + off;
   if (pos != da_scan_x) {

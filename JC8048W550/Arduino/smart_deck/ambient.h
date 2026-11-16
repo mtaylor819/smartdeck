@@ -37,6 +37,9 @@ static float amb_last_lux_val = 0.0f;
 static bool amb_lux_sent_once = false;
 static unsigned long amb_last_explicit_ms = 0;
 static bool amb_explicit_seen = false;
+static unsigned long amb_probe_ms = 0;  // millis() when continuous mode was started (M6)
+#define AMB_FIRST_READ_DELAY_MS 250UL   // discard reads before the first measurement can have completed
+#define AMB_ZERO_GRACE_MS 1000UL        // a literal 0 lux right after start is more likely "no data yet" than "pitch dark"
 
 static bool amb_probe_addr(uint8_t addr) {
   Wire.beginTransmission(addr);
@@ -58,6 +61,7 @@ static bool amb_probe() {
   amb_addr = found;
   amb_fail = 0;
   amb_lf_init = false;
+  amb_probe_ms = millis();  // M6: the first conversion takes ~120-180 ms; until then the data register reads 0
   return true;
 }
 
@@ -92,20 +96,25 @@ static int amb_target_pct() {
   float t = (amb_lf - lo) / (hi - lo);
   if (t < 0.0f) t = 0.0f;
   if (t > 1.0f) t = 1.0f;
-  return amb_min + (int)(t * (float)(amb_max - amb_min) + 0.5f);
+  int pct = amb_min + (int)(t * (float)(amb_max - amb_min) + 0.5f);
+  if (pct < 1) pct = 1;  // L3: the Mac allows min 0; never auto-dim the backlight fully OFF (set_brightness(0) = black screen)
+  return pct;
 }
 
 void ambient_loop() {
   if (!amb_present) return;
   unsigned long now = millis();
 
-  if (now - amb_last_read >= AMB_READ_INTERVAL_MS) {
+  if (now - amb_last_read >= AMB_READ_INTERVAL_MS && now - amb_probe_ms >= AMB_FIRST_READ_DELAY_MS) {
     amb_last_read = now;
     float lux;
     if (amb_read_lux(lux)) {
       amb_fail = 0;
       float l = log10f(lux + 1.0f);
       if (!amb_lf_init) {
+        // M6: initialise the filter from the first VALID sample. Starting from a bogus 0 made brightness sink toward `min` at 1% per
+        // 100 ms for several seconds at every boot, then climb back.
+        if (lux <= 0.0f && now - amb_probe_ms < AMB_ZERO_GRACE_MS) return;
         amb_lf = l;
         amb_lf_init = true;
       } else {
@@ -152,7 +161,7 @@ bool ambient_command(const String& c) {
 
   int en = 0, mn = 0, mx = 0, lo = amb_lux_lo, hi = amb_lux_hi;
   int n = sscanf(c.c_str() + 12, "%d:%d:%d:%d:%d", &en, &mn, &mx, &lo, &hi);
-  bool ok = n >= 3 && (en == 0 || en == 1) && mn >= 1 && mn <= 100 && mx >= mn && mx <= 100;
+  bool ok = n >= 3 && (en == 0 || en == 1) && mn >= 0 && mn <= 100 && mx >= mn && mx <= 100;  // L3: min 0 allowed (floored to 1% when dimming)
   if (n >= 5) ok = ok && lo >= 1 && hi > lo && hi <= 65535;
   if (!ok) {
     Serial.println("AUTODIM:err:args");

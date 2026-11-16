@@ -5,6 +5,7 @@
 
 #include "config.h"
 #include "live_table.h"  // [live] RAM-only per-button display overrides (consulted by draw_single_button)
+#include "toggle_table.h"  // [toggle] toggle states survive draw_page() rebuilds (alert clear, BT toast/indicator removal, swipe clamp, wake)
 
 // Receiver MAC for ESP-NOW dongle mode
 uint8_t receiver_mac[] = RECEIVER_MAC;
@@ -1922,7 +1923,8 @@ void draw_page(int page_index) {
         // Toggle
         else if (btn_info.action == "toggle") {
           btn_info.value = "toggle";
-          current_toggles[current_button_vector_index].state = true;
+          // [toggle] restore the remembered state (default ON) instead of forcing ON on every full redraw
+          current_toggles[current_button_vector_index].state = toggle_get(page_index, current_button_vector_index);
           const char* on_color_hex = button_cfg["toggleData"]["onColor"];
           if (on_color_hex) {
             current_toggles[current_button_vector_index].onColor = hex_to_rgb565(on_color_hex);
@@ -2352,10 +2354,18 @@ void loop() {
       // --- Parlaklık ---
       if (command.startsWith("SET_BRIGHTNESS:")) {
         int val = command.substring(15).toInt();
-        set_brightness(val);
-        preferences.putInt("bright", val);
-        Serial.printf("Brightness set to %d%%\n", val);
-        update_activity();
+        if (is_sleeping || is_deep_sleeping) {
+          // [L10] A brightness change sent while the deck sleeps is a background setting (e.g. the Mac's night schedule): it must
+          // neither wake the deck nor raise the dimmed backlight. Store it; the wake path applies current_brightness.
+          current_brightness = val < 0 ? 0 : (val > 100 ? 100 : val);
+          preferences.putInt("bright", val);
+          Serial.printf("Brightness set to %d%% (applies on wake)\n", current_brightness);
+        } else {
+          set_brightness(val);
+          preferences.putInt("bright", val);
+          Serial.printf("Brightness set to %d%%\n", val);
+          update_activity();
+        }
       }
 
       if (command.startsWith("SWAP_BTN:")) {
@@ -2380,6 +2390,7 @@ void loop() {
               tmp.set(btns[fromIdx]);
               btns[fromIdx] = btns[toIdx];
               btns[toIdx] = tmp.as<JsonVariant>();
+              toggle_swap(page, fromIdx, toIdx);  // [toggle] the states move with the buttons
 
               // Save config to SD (persistent)
               saveConfigToSD();
@@ -2634,7 +2645,8 @@ void loop() {
           }
         }
         update_activity();
-      } else if (!command.startsWith("SET_TIME:") && !command.startsWith("SET_BTN_DATA:")) {
+      } else if (!command.startsWith("SET_TIME:") && !command.startsWith("SET_BTN_DATA:") && !command.startsWith("SET_BRIGHTNESS:")) {
+        // SET_BRIGHTNESS decides for itself whether it counts as activity (it must not wake a sleeping deck, see above).
         // SET_BTN_DATA is a background host update (live widgets): it must not wake a sleeping deck.
         update_activity();
       }
@@ -2960,6 +2972,9 @@ void loop() {
           if (!error) {
             // 2. Copy to main config (RAM JSON updated)
             buttons[idx] = tempDoc.as<JsonObject>();
+            // [toggle][live] the button was replaced: forget its old toggle state and any live label/colour override (L6)
+            toggle_clear(page, idx);
+            live_clear(page, idx);
 
             // 3. Save to SD Card (persistent across restarts)
             saveConfigToSD();
@@ -3123,6 +3138,17 @@ void loop() {
     if (alert_touch_ack(is_touched_now)) {
       is_touched_now = false;
       last_valid_touch_time = 0;
+      // [M1] This touch is swallowed. Cancel a press that was already in flight (finger down before the alert appeared): otherwise the
+      // forced "finger up" below runs the release branch and fires the button under the finger. Also forget gesture state.
+      if (last_touched_button_index != -1 && last_touched_button_index < (int)current_buttons.size()) {
+        const auto& ob = current_buttons[last_touched_button_index];
+        gfx->drawRoundRect(ob.x, ob.y, ob.w, ob.h, CORNER_RADIUS, theme_stroke_color_rgb565);
+        gfx->drawRoundRect(ob.x + 1, ob.y + 1, ob.w - 2, ob.h - 2, CORNER_RADIUS > 0 ? CORNER_RADIUS - 1 : 0, theme_stroke_color_rgb565);
+      }
+      last_touched_button_index = -1;
+      was_touched = false;
+      long_press_triggered = false;
+      gestures_reset();
     }
 
     // Uyku Modundan Çıkış
@@ -3267,10 +3293,11 @@ void loop() {
               draw_single_button(last_touched_button_index);
               Serial.printf("TIMER_UPDATE:%d:%d:0:%d\n", current_page, last_touched_button_index, timer.lastSeconds);
             }
-          } else if (released_btn.action == "key" || released_btn.action == "text" || released_btn.action == "app" || released_btn.action == "script" || released_btn.action == "website" || released_btn.action == "media" || released_btn.action == "mouse" || released_btn.action == "sound" || released_btn.action == "multi" || released_btn.action == "blehost" /* [ble-host hook] routed to send_pc_command, which runs it locally */) {
+          } else if (released_btn.action == "key" || released_btn.action == "text" || released_btn.action == "app" || released_btn.action == "script" || released_btn.action == "website" || released_btn.action == "media" || released_btn.action == "mouse" || released_btn.action == "sound" || released_btn.action == "multi" || released_btn.action == "blehost" /* [ble-host hook] routed to send_pc_command, which runs it locally */ || released_btn.action == "blepair" /* [ble-pair] same: opens the pairing window on the deck */) {
             send_pc_command(current_page, last_touched_button_index);
           } else if (released_btn.action == "toggle") {
             current_toggles[last_touched_button_index].state = !current_toggles[last_touched_button_index].state;
+            toggle_set(current_page, last_touched_button_index, current_toggles[last_touched_button_index].state);  // [toggle] remember it
             draw_single_button(last_touched_button_index);
             send_pc_command(current_page, last_touched_button_index);
           } else if (released_btn.action == "counter") {

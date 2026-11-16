@@ -83,6 +83,8 @@ Lets the deck act as a standalone Bluetooth keyboard on any machine (Mac, Window
 
 - Pairing: Just Works + bonding (LE Secure Connections), bonds kept in NVS by NimBLE (NimBLE default: 3 bonds). Advertises with the
   HID-keyboard appearance (0x03C1) and the HID service UUID; re-advertises after a disconnect.
+  **v4: new pairings are only possible inside a short pairing window** (`BLE_PAIR:<seconds>`, a `{"type":"blepair"}` button, or automatically
+  for 120 s the first time BLE runs with no bonds). See "BLE pairing safety (v4)" below.
 - Reports: keyboard (ID 1: modifiers + 6 keys) and consumer control (ID 2: play/pause, next, previous, volume +/-, mute).
 - Standalone buttons (only when no host app is connected and a BLE host is connected): `type:"key"` + `combo`, `type:"text"` + `text`,
   `type:"media"` + `media`. Combo tokens match `companion-mac/src/keymap.ts` (all 104 key/alias/modifier names from that file were
@@ -180,3 +182,81 @@ BH1750 auto-dim, swipe/hold gestures, WiFi + authenticated TCP host link + OTA +
   draws its configured `label`; set it to `0` for exactly the stock behaviour. A button that has an icon still shows no text unless the
   icon contains it or a live label is set.
 - Unverified on hardware: everything above (drawing, HTTP polling, TLS heap use, queueing of presses behind polls).
+
+## BLE pairing safety (v4) and touch/redraw fixes (`ble_hid.h`, `ble_pairing.h`, `ble_report_map.h`, `toggle_table.h`, `led_alert.h`, `gestures.h`)
+
+Response to the firmware review (BLE H1, touch M1/M2, redraw M3, report map M4, standalone M5, auto-dim M6 + cheap Lows). **Compile-verified and
+unit-tested on a PC only; none of it has run on a real deck, and nothing has been paired with a real host.**
+
+### Pairing window (H1)
+Just Works has no man-in-the-middle protection and no confirmation on the deck, so the safeguard is *when* pairing is possible:
+
+| Way to open the window | Details |
+|---|---|
+| automatic | 120 s the first time BLE runs while NimBLE holds no bonds (once; it re-arms after `clear_bonds:true` or the one-time purge below) |
+| `BLE_PAIR:<1..300>` | seconds, digits only; replies `BLE_PAIR:<n>`, `BLE_PAIR:err:ble_off` or `BLE_PAIR:err:bad_seconds` |
+| button `{"type":"blepair"}` | device-local (runs on the deck even with a host connected, like `blehost`); opens 120 s |
+
+While it is open an orange `BT PAIRING  <n>s` pill shows in the header strip (repainted at 1 Hz, skipped while an alert banner or the slot toast
+owns the header or the deck sleeps) and the deck stays awake. It closes when it expires, when the stack restarts, or as soon as a **new** host
+pairs (so one window pairs one host; an already-known host reconnecting does not close it).
+- **Outside the window bonding is switched off** (`ble_hs_cfg.sm_bonding`, flipped with `NimBLEDevice::setSecurityAuth`), so a stranger cannot
+  create a bond (no NVS writes either).
+- A link is **approved** only when it is encrypted and (bonded or the window is open). Encrypted-but-unapproved links are terminated at once
+  (`ble_gap_terminate` from `onAuthenticationComplete`); links that never authenticate are dropped after 15 s. "connected" in `NET_STATUS`
+  means an *approved* host, never just any connection.
+- **HID reports are never sent while any encrypted-but-unapproved link exists** (`ble_send_gate`): NimBLE's `notify()` goes to every *encrypted*
+  subscriber, so one lingering stranger on an encrypted link would otherwise see the keystrokes. Advertising keeps running while only
+  unapproved links exist (up to 3 connections), so a stranger idling on a link cannot lock the real host out.
+- **One-time purge:** the first boot of this firmware (`BLE_SECURITY_VERSION` 4) deletes every bond made by the old always-open firmware and
+  re-opens the automatic window. **You must remove "SmartDeck" from each machine's Bluetooth list and pair again.**
+- **Report map changed (M4):** keyboard usages now go up to `0xE7` (was `0x65`) so F13-F24 are inside the declared range. Hosts cache the report
+  map, so this is another reason every machine must forget the deck and pair again.
+- Not done: numeric-comparison confirmation on the screen (would add real MITM protection). The window + indicator is the mitigation: only
+  pair when you opened it, in a place you trust, and watch the screen.
+
+What was **verified in the vendored NimBLE-Arduino 1.4.3 source** vs **assumed**:
+- Verified: `NimBLEDevice::setSecurityAuth()` writes `ble_hs_cfg.sm_bonding` directly (run-time changeable); `NimBLECharacteristic::notify()` skips
+  subscribers whose link is not encrypted when the characteristic has `READ_ENC` (the HID input reports do), but delivers to *all* encrypted
+  subscribers; both `onConnect`/`onDisconnect` overloads with the connection descriptor are dispatched; `getPeerDevices()`, `disconnect(handle)`,
+  `ble_gap_conn_find` and `ble_gap_terminate` exist; `CONFIG_BT_NIMBLE_MAX_CONNECTIONS` is 3.
+- **Review correction:** the review said a stranger "gets every notify in clear" without pairing. In this library version `notify()` already skips
+  unencrypted subscribers; the real exposure is a stranger who *completes* Just-Works pairing, which is what the window + approval gate closes.
+- Assumed (unverified on hardware): that `sec_state.bonded` is already set when the encryption-change event fires for a re-encryption with a stored
+  bond (the code also consults the bond store, `NimBLEDevice::isBonded`, and accepts an encrypted link inside the window regardless, so a first
+  pairing is not kicked if the flag lags); that terminating a link from inside the host-task callback is safe (the library does the same in its
+  own examples); that bonded hosts using resolvable private addresses re-encrypt normally with bonding disabled (re-encryption uses the stored
+  key; this is the common keyboard-on-NimBLE case). The controller whitelist (`setScanFilter`) is deliberately **not** used: resolving RPA peers
+  through it is unreliable on this stack.
+
+### Touch and redraw (M1, M2, M3)
+- **M1:** an alert only accepts a touch that *began after* it appeared (armed by a finger-up poll). A finger already down is swallowed without
+  acknowledging, the in-flight press is cancelled (border restored, `was_touched`/`long_press_triggered` cleared) and the gesture tracker is reset, so
+  the swallowed touch can neither acknowledge, press the button under it, nor turn into a swipe.
+- **M2:** after `BTN_HOLD` fires, the rest of that touch is consumed (`gestures.h`), so sliding from the held button onto a neighbour no longer fires
+  the neighbour. The lift poll still runs the release branch (border restored, nothing sent).
+- **M3:** `toggle_table.h` remembers OFF toggles (key `page*100+idx`, 64 entries, oldest evicted, no heap) and `draw_page()` restores them, so alert
+  clear, BT toast/indicator removal, clamped swipes, wake and page changes no longer flip OFF toggles back to ON. `SWAP_BTN` moves the states with
+  the buttons; `SET_BTN_DATA` clears the replaced button's toggle state. (Behaviour change vs stock: toggle state now also survives page switches.)
+- Host model of the touch block with before/after output (uses the real `gesture_logic.h`):
+  `g++ -std=c++17 -Wall -Wextra -iquote JC8048W550/Arduino/smart_deck firmware/tests/touch_model_test.cpp -o /tmp/tm && /tmp/tm`
+
+### Other fixes
+- **M5:** `ble_button` only claims a key/text/media press when the approved host has subscribed to the report; otherwise it returns false so the
+  WiFi/Home Assistant fallback still runs.
+- **M6:** auto-dim discards reads for 250 ms after the sensor is started and initialises its filter from the first valid sample (a literal 0 lux in the
+  first second is treated as "no data yet"), so brightness no longer sinks at boot.
+- **L2:** `ALERT:red:abc` (non-numeric seconds) is rejected (`ALERT:err:seconds`) instead of becoming a never-expiring alert.
+- **L3:** `SET_AUTODIM` accepts min 0 like the Mac (floored to 1% when dimming, never fully off).
+- **L4:** the diag-anim scan position no longer jumps every 5.4 h (64-bit intermediate).
+- **L6:** `SET_BTN_DATA` clears that button's live override (`live_clear`).
+- **L7:** `ble_peer` is only written by the main loop (the NimBLE task stages the address), so no torn reads.
+- **L10:** `SET_BRIGHTNESS` while the deck sleeps no longer wakes it or raises the dimmed backlight; the value is stored and applied on wake.
+
+Skipped Lows (with reasons): **L1** hold actions in standalone mode (the device has no hold action to run: `hold:true` is only a flag and the action lives on
+the Mac; needs a protocol addition), **L5** stale brightness after wake with auto-dim (a ~10 s fade, cosmetic), **L8** label contrast on uploaded full-bleed
+photos (design decision for the icon pipeline), **L9** a hotkey interleaving with typing can drop one character (cosmetic).
+
+Pure-logic tests (no Arduino needed): `ble_security_test.cpp` (pairing window incl. millis rollover, BLE_PAIR parsing, approval verdicts, report-map
+usage range decoded the way a host reads it, toggle table), `touch_model_test.cpp`, plus the existing `ble_keys_test.cpp` / `ble_slots_test.cpp`:
+`g++ -std=c++17 -Wall -Wextra -iquote JC8048W550/Arduino/smart_deck firmware/tests/<name>.cpp -o /tmp/t && /tmp/t`
