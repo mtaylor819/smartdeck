@@ -10,6 +10,11 @@ export const SLEEP_SCREENS: SleepScreen[] = ['clock', 'diag', 'diag-anim', 'warp
 export const ALERT_KINDS = ['red', 'yellow', 'blue', 'green'] as const;
 export type AlertKind = (typeof ALERT_KINDS)[number];
 export const DIM_LED_NAMES = ['off', 'breathing', 'rainbow', 'pulse', 'comet', 'sparkle'];
+/** Capabilities advertised in NET_STATUS (PROTOCOL.md v3). */
+export const CAPS = ['btn_live', 'ha_state', 'ble_hosts'];
+export const BLE_SLOTS = 3;
+/** RAM-only visual override for one button (SET_BTN_LIVE). Never written to the SD card. */
+export interface LiveOverride { label?: string; labelColor?: string; btnColor?: string; labelSize?: number; icon?: string }
 
 export interface DeckConfig {
   title?: string;
@@ -34,7 +39,13 @@ export interface VirtualDeckState {
   diag: { cpu: number; mem: number; disk: number; rx: number; tx: number; uptimeMin: number; host: string; at: number } | null;
   /** Non-secret view of provisioning. Secrets live in a private field and are never exposed. */
   net: { ssid: string; host: string; standalone: 'auto' | 'always' | 'never'; wifi: boolean; tz: string; hasPass: boolean; hasToken: boolean; hasHaUrl: boolean; hasHaToken: boolean };
-  ble: { enabled: boolean; name: string; peer: string };
+  ble: { enabled: boolean; name: string; peer: string; slot: number; slots: string[]; bonds: boolean[] };
+  /** SET_BTN_LIVE overrides keyed "page:idx" (insertion order = age). RAM only: lost on reboot, never persisted. */
+  live: Record<string, LiveOverride>;
+  /** Brief on-screen message, e.g. "BT: Work PC". */
+  toast: { text: string; until: number } | null;
+  /** Last on-deck Home Assistant poll results per entity (non-secret). */
+  haState: Record<string, { state: string; at: number }>;
   alert: { kind: AlertKind; text: string; until: number; startedAt: number } | null;
   autodim: { enabled: boolean; min: number; max: number; luxLow: number; luxHigh: number; sensor: boolean; lux: number };
   gestures: { swipe: boolean; holdMs: number };
@@ -62,14 +73,28 @@ export interface EmulatorOptions {
   rebootDelayMs?: number;
   bootMs?: number;
   cleanIcons?: boolean;
+  /** fetch used for on-deck Home Assistant polling and standalone ha/http presses (tests may inject one). */
+  fetchImpl?: typeof fetch;
+  /** Per-request timeout (firmware: 3 s). */
+  haTimeoutMs?: number;
+  /** Delay before re-polling an entity after an `ha` button press (spec: ~700 ms). */
+  haRepollMs?: number;
+  /** Size of the live-override table (spec: at least 24; oldest dropped when full). */
+  liveCapacity?: number;
 }
 
 const HOST_PRESENCE_MS = 15_000;
 const SAFE_FILE_RE = /^[A-Za-z0-9._-]{1,64}$/;
 const HEX6 = /^[0-9a-fA-F]{6}$/;
+const ENTITY_RE = /^[a-z_]+\.[a-z0-9_]+$/;
+const SERVICE_RE = /^[a-z_]+\.[a-z0-9_]+$/;
+const LIVE_KEYS = ['label', 'labelColor', 'btnColor', 'labelSize', 'icon'] as const;
+const HA_MAX_BUTTONS = 8;
+const TOAST_MS = 2500;
+const HA_UNAVAILABLE_COLOR = '3a3a3a';
 
 /** Commands that do NOT count as user activity (mirror of the patched firmware + features.h modules). */
-const NO_WAKE = ['HB', 'DIAG:', 'SET_BTN_DATA:', 'SET_TIME:', 'WEATHER:', 'SET_DIM_LED:', 'SET_SLEEP_SCREEN:', 'SET_NET:', 'GET_NET', 'SET_BLE:', 'SET_AUTODIM:', 'SET_GESTURES:'];
+const NO_WAKE = ['HB', 'DIAG:', 'SET_BTN_DATA:', 'SET_TIME:', 'WEATHER:', 'SET_DIM_LED:', 'SET_SLEEP_SCREEN:', 'SET_NET:', 'GET_NET', 'SET_BLE:', 'SET_AUTODIM:', 'SET_GESTURES:', 'SET_BTN_LIVE:', 'BLE_HOST:'];
 
 const defaultTheme = { bg_color: '000000', btn_color: '333333', text_color: 'ffffff', stroke_color: '555555', shadow_color: '000000' };
 
@@ -88,6 +113,9 @@ export class DeckEmulator extends EventEmitter {
   private lastLux = -1;
   private lastLuxEmit = -1e9;
   private clients = () => 0;
+  private haNext = new Map<string, number>();
+  private haChain: Promise<void> = Promise.resolve();
+  private tasks = new Set<Promise<unknown>>();
   private readonly now: () => number;
   private readonly o: Required<Omit<EmulatorOptions, 'token' | 'name'>> & { token?: string; name: string };
 
@@ -105,6 +133,10 @@ export class DeckEmulator extends EventEmitter {
       rebootDelayMs: opts.rebootDelayMs ?? 500,
       bootMs: opts.bootMs ?? 1500,
       cleanIcons: opts.cleanIcons ?? true,
+      fetchImpl: opts.fetchImpl ?? ((...a: Parameters<typeof fetch>) => fetch(...a)),
+      haTimeoutMs: opts.haTimeoutMs ?? 3000,
+      haRepollMs: opts.haRepollMs ?? 700,
+      liveCapacity: opts.liveCapacity ?? 32,
     };
     this.now = this.o.now;
     mkdirSync(this.o.dataDir, { recursive: true });
@@ -123,7 +155,8 @@ export class DeckEmulator extends EventEmitter {
       dimLed: 0, led: { r: 217, g: 70, b: 239, tail: 7, brightness: 255 }, knobRaw: 0,
       clock: { set: false, h: 0, m: 0, s: 0, setAt: 0 }, weather: null, diag: null,
       net: { ssid: '', host: 'smartdeck', standalone: 'auto', wifi: true, tz: '', hasPass: false, hasToken: false, hasHaUrl: false, hasHaToken: false },
-      ble: { enabled: false, name: 'SmartDeck', peer: '' }, alert: null,
+      ble: { enabled: false, name: 'SmartDeck', peer: '', slot: 1, slots: ['Host 1', 'Host 2', 'Host 3'], bonds: [false, false, false] }, alert: null,
+      live: {}, toast: null, haState: {},
       autodim: { enabled: false, min: 10, max: 100, luxLow: 5, luxHigh: 400, sensor: this.o.luxSensor, lux: 150 },
       gestures: { swipe: true, holdMs: 600 }, toggles: {}, counters: {}, timers: {},
       hostLastSeen: 0, upload: { active: false, file: '', remaining: 0 }, rebooting: false, lastTime: t, log: [],
@@ -137,7 +170,7 @@ export class DeckEmulator extends EventEmitter {
     const s = this.state;
     const data = {
       brightness: s.brightness, sleepScreen: s.sleepScreen, sleep: { enabled: s.sleep.enabled, minutes: s.sleep.minutes, deepEnabled: s.sleep.deepEnabled, deepMinutes: s.sleep.deepMinutes },
-      dimLed: s.dimLed, led: s.led, net: { ssid: s.net.ssid, host: s.net.host, standalone: s.net.standalone, wifi: s.net.wifi, tz: s.net.tz }, ble: { enabled: s.ble.enabled, name: s.ble.name },
+      dimLed: s.dimLed, led: s.led, net: { ssid: s.net.ssid, host: s.net.host, standalone: s.net.standalone, wifi: s.net.wifi, tz: s.net.tz }, ble: { enabled: s.ble.enabled, name: s.ble.name, slot: s.ble.slot, slots: s.ble.slots, bonds: s.ble.bonds },
       autodim: { enabled: s.autodim.enabled, min: s.autodim.min, max: s.autodim.max, luxLow: s.autodim.luxLow, luxHigh: s.autodim.luxHigh }, gestures: s.gestures, secrets: this.secrets,
     };
     const f = this.prefsPath();
@@ -156,7 +189,12 @@ export class DeckEmulator extends EventEmitter {
       if (typeof d.dimLed === 'number') s.dimLed = d.dimLed;
       Object.assign(s.led, d.led ?? {});
       Object.assign(s.net, d.net ?? {});
-      Object.assign(s.ble, d.ble ?? {});
+      const b = d.ble ?? {};
+      if (typeof b.enabled === 'boolean') s.ble.enabled = b.enabled;
+      if (typeof b.name === 'string') s.ble.name = b.name;
+      if (Number.isInteger(b.slot) && b.slot >= 1 && b.slot <= BLE_SLOTS) s.ble.slot = b.slot;
+      if (Array.isArray(b.slots) && b.slots.length === BLE_SLOTS && b.slots.every((x: unknown) => typeof x === 'string')) s.ble.slots = b.slots;
+      if (Array.isArray(b.bonds) && b.bonds.length === BLE_SLOTS) s.ble.bonds = b.bonds.map(Boolean);
       Object.assign(s.autodim, d.autodim ?? {});
       Object.assign(s.gestures, d.gestures ?? {});
       this.secrets = d.secrets ?? {};
@@ -228,6 +266,7 @@ export class DeckEmulator extends EventEmitter {
       s.sleep.deepSleeping = false;
       s.sleep.sleeping = false;
       this.resetToggles(s.page); // wake redraws the page via draw_page()
+      this.haNext.clear(); // poll Home Assistant right away after waking
       this.changed();
     }
   }
@@ -245,6 +284,8 @@ export class DeckEmulator extends EventEmitter {
       sl.deepSleeping = true; this.changed();
     }
     if (s.alert && s.alert.until > 0 && t >= s.alert.until) { s.alert = null; this.changed(); }
+    if (s.toast && t >= s.toast.until) { s.toast = null; this.changed(); }
+    this.haPollTick();
     // upload timeouts
     if (this.up.mode === 'data' && t - this.up.lastData > this.o.dataTimeoutMs) {
       this.out('ERR_DATA_TIMEOUT');
@@ -373,6 +414,7 @@ export class DeckEmulator extends EventEmitter {
   private boot(): void {
     const s = this.state;
     s.rebooting = false; s.page = 0; s.alert = null; s.hostLastSeen = 0; s.toggles = {}; s.timers = {};
+    s.live = {}; s.toast = null; s.haState = {}; this.haNext.clear(); // RAM-only state is lost on reboot
     s.sleep.sleeping = false; s.sleep.deepSleeping = false; s.sleep.lastActivity = this.now(); s.clock.set = false;
     this.up = { mode: 'off', name: '', remaining: 0, chunks: [], lastCmd: 0, lastData: 0 };
     this.loadConfig();
@@ -490,6 +532,8 @@ export class DeckEmulator extends EventEmitter {
       return this.out('BTN_SWAPPED_FAIL');
     }
     if (line.startsWith('SET_BTN_DATA:')) return this.setBtnData(line);
+    if (line.startsWith('SET_BTN_LIVE:')) return this.setBtnLive(line);
+    if (line.startsWith('BLE_HOST:')) return this.bleHostCmd(arg('BLE_HOST:').trim());
     if (line.startsWith('WEATHER:')) return this.weather(arg('WEATHER:'));
     if (line.startsWith('DIAG:')) return this.diag(arg('DIAG:'));
     if (line.startsWith('SET_SLEEP_SCREEN:')) {
@@ -596,7 +640,8 @@ export class DeckEmulator extends EventEmitter {
     const s = this.state, on = this.wifiState() === 'connected';
     return {
       wifi: on ? 'connected' : 'off', ip: on ? '192.168.1.123' : '', rssi: on ? -52 : 0, host: s.net.host, ssid: s.net.ssid,
-      clients: this.clients(), ota: on && !!this.secrets.token, ntp: on, ble: !s.ble.enabled ? 'off' : s.ble.peer ? 'connected' : 'advertising', ble_peer: s.ble.peer, fw: 'virtual-1.0',
+      clients: this.clients(), ota: on && !!this.secrets.token, ntp: on, ble: !s.ble.enabled ? 'off' : s.ble.peer ? 'connected' : 'advertising', ble_peer: s.ble.peer, fw: 'virtual-1.1',
+      caps: [...CAPS], ble_slot: s.ble.slot, ble_slots: [...s.ble.slots],
     };
   }
 
@@ -609,15 +654,219 @@ export class DeckEmulator extends EventEmitter {
 
   private setBle(raw: string): void {
     let j: any;
-    try { j = JSON.parse(raw); if (j === null || typeof j !== 'object') throw new Error('x'); } catch { return this.out('BLE_SET:err:bad_json'); }
+    try { j = JSON.parse(raw); if (j === null || typeof j !== 'object' || Array.isArray(j)) throw new Error('x'); } catch { return this.out('BLE_SET:err:bad_json'); }
     const b = this.state.ble;
     if ('name' in j && (typeof j.name !== 'string' || !/^[\x20-\x7e]{1,24}$/.test(j.name))) return this.out('BLE_SET:err:bad_name');
     if ('enabled' in j && typeof j.enabled !== 'boolean') return this.out('BLE_SET:err:bad_enabled');
+    if ('slots' in j && (!Array.isArray(j.slots) || j.slots.length < 1 || j.slots.length > BLE_SLOTS || !j.slots.every((x: unknown) => typeof x === 'string' && /^[\x20-\x7e]{1,12}$/.test(x))))
+      return this.out('BLE_SET:err:bad_slots');
+    if ('clear_bonds' in j && !(j.clear_bonds === true || (Number.isInteger(j.clear_bonds) && j.clear_bonds >= 1 && j.clear_bonds <= BLE_SLOTS)))
+      return this.out('BLE_SET:err:bad_clear_bonds');
     if ('name' in j) b.name = j.name;
     if ('enabled' in j) { b.enabled = j.enabled; if (!b.enabled) b.peer = ''; }
+    if ('slots' in j) (j.slots as string[]).forEach((n, i) => { b.slots[i] = n; });
+    if ('clear_bonds' in j) {
+      if (j.clear_bonds === true) { b.bonds = [false, false, false]; b.peer = ''; }
+      else { b.bonds[j.clear_bonds - 1] = false; if (j.clear_bonds === b.slot) b.peer = ''; }
+    }
     this.savePrefs();
     this.out('BLE_SET:ok');
     this.emitNetStatus(false);
+  }
+
+  /** BLE_HOST:<1|2|3|next>: switch the BLE identity, dropping the current peer. Shared by the host command and blehost buttons. */
+  private switchBleSlot(arg: string | number): { ok: true; slot: number } | { ok: false; err: string } {
+    const b = this.state.ble;
+    if (!b.enabled) return { ok: false, err: 'ble_off' };
+    let n: number;
+    if (arg === 'next') n = (b.slot % BLE_SLOTS) + 1;
+    else if (arg === 1 || arg === 2 || arg === 3) n = arg;
+    else if (typeof arg === 'string' && /^[123]$/.test(arg)) n = Number(arg);
+    else return { ok: false, err: 'bad_slot' };
+    b.slot = n; b.peer = '';
+    this.state.toast = { text: `BT: ${b.slots[n - 1]}`, until: this.now() + TOAST_MS };
+    this.savePrefs();
+    this.changed();
+    return { ok: true, slot: n };
+  }
+
+  private bleHostCmd(arg: string): void {
+    const r = this.switchBleSlot(arg);
+    this.out(r.ok ? `BLE_HOST:${r.slot}` : `BLE_HOST:err:${r.err}`);
+    if (r.ok) this.emitNetStatus(false); // reply first, then the (rate-limited) state-change status, like the firmware
+  }
+
+  /** UI/touch-side entry for a `blehost` button press or the side-panel slot buttons. */
+  bleHost(arg: string | number): { ok: boolean; slot?: number; err?: string } {
+    this.wake();
+    const r = this.switchBleSlot(arg);
+    if (!r.ok) { this.state.toast = { text: r.err === 'ble_off' ? 'BT: off' : 'BT: ?', until: this.now() + TOAST_MS }; this.changed(); }
+    else { this.log(`BLE host slot ${r.slot} (${this.state.ble.slots[r.slot - 1]})`); this.emitNetStatus(false); }
+    return r.ok ? { ok: true, slot: r.slot } : { ok: false, err: r.err };
+  }
+
+  // ---- live button overrides (SET_BTN_LIVE) ------------------------------------------------------------------
+  private setBtnLive(line: string): void {
+    const s = this.state;
+    const p1 = line.indexOf(':'), p2 = line.indexOf(':', p1 + 1), p3 = line.indexOf(':', p2 + 1);
+    const reject = (why: string) => this.log(`SET_BTN_LIVE rejected: ${why}`);
+    if (p1 < 0 || p2 < 0 || p3 < 0) return reject('format');
+    const page = Number(line.slice(p1 + 1, p2)), idx = Number(line.slice(p2 + 1, p3));
+    if (!Number.isInteger(page) || page < 0 || page >= s.config.pages.length) return reject('page');
+    const cells = (s.config.grid?.cols ?? 3) * (s.config.grid?.rows ?? 3);
+    if (!Number.isInteger(idx) || idx < 0 || idx >= cells) return reject('index');
+    const body = line.slice(p3 + 1);
+    if (body.length > 512) return reject('too long');
+    let j: any;
+    try { j = JSON.parse(body); if (j === null || typeof j !== 'object' || Array.isArray(j)) throw new Error('x'); } catch { return reject('bad json'); }
+    const o: LiveOverride = {};
+    for (const k of LIVE_KEYS) {
+      if (!(k in j)) continue;
+      const v = j[k];
+      if (k === 'label') { if (typeof v !== 'string' || v.length > 24) return reject('label'); o.label = v; }
+      else if (k === 'labelColor' || k === 'btnColor') { if (typeof v !== 'string' || !HEX6.test(v)) return reject(k); o[k] = v.toLowerCase(); }
+      else if (k === 'labelSize') { if (!Number.isInteger(v) || v < 8 || v > 40) return reject('labelSize'); o.labelSize = v; }
+      else if (k === 'icon') { if (typeof v !== 'string' || !SAFE_FILE_RE.test(v) || v.startsWith('.')) return reject('icon'); o.icon = v; }
+    }
+    this.liveMerge(page, idx, o);
+  }
+
+  /** Merge keys into the override for page:idx (null deletes a key); newest entries sit last, oldest are dropped when full. */
+  private liveMerge(page: number, idx: number, patch: { [K in keyof LiveOverride]?: LiveOverride[K] | null }): void {
+    const live = this.state.live, key = this.key(page, idx);
+    const cur: Record<string, unknown> = { ...(live[key] ?? {}) };
+    for (const [k, v] of Object.entries(patch)) { if (v === null || v === undefined) delete cur[k]; else cur[k] = v; }
+    delete live[key]; // re-insert so it counts as the newest entry
+    if (Object.keys(cur).length === 0) return;
+    live[key] = cur as LiveOverride;
+    const keys = Object.keys(live);
+    for (let i = 0; keys.length - i > this.o.liveCapacity; i++) delete live[keys[i]];
+  }
+
+  // ---- on-deck Home Assistant (state display + standalone ha/http presses) -----------------------------------
+  private haCreds(): { base: string; token: string } | null {
+    const { ha_url, ha_token } = this.secrets;
+    return ha_url && ha_token ? { base: ha_url.replace(/\/+$/, ''), token: ha_token } : null;
+  }
+
+  /** Polling runs only when WiFi is up, the deck is awake, HA is configured and no host is covering for it (or standalone=always). */
+  private haPollEligible(): boolean {
+    const s = this.state;
+    if (s.rebooting || s.sleep.sleeping || s.sleep.deepSleeping || this.wifiState() !== 'connected' || !this.haCreds()) return false;
+    return s.net.standalone === 'always' || !this.hostActive();
+  }
+
+  private haPollTick(): void {
+    if (!this.haPollEligible()) return;
+    const s = this.state, t = this.now(), page = s.page;
+    const due: Array<{ idx: number; entity: string; hs: Record<string, any> }> = [];
+    let n = 0;
+    (s.config.pages[page]?.buttons ?? []).forEach((b, idx) => {
+      const hs = b?.ha_state;
+      if (!hs || typeof hs.entity !== 'string' || !ENTITY_RE.test(hs.entity)) return;
+      if (++n > HA_MAX_BUTTONS) return;
+      const key = this.key(page, idx);
+      if (t < (this.haNext.get(key) ?? 0)) return;
+      const interval = Math.min(3600, Math.max(5, Number(hs.interval) || 10));
+      this.haNext.set(key, t + interval * 1000);
+      due.push({ idx, entity: hs.entity, hs });
+    });
+    if (due.length) this.haChain = this.haChain.then(() => this.haPollEntities(page, due)).catch(() => {});
+  }
+
+  /** Sequential, one request at a time (the firmware does this in a single worker task). */
+  private async haPollEntities(page: number, due: Array<{ idx: number; entity: string; hs: Record<string, any> }>): Promise<void> {
+    for (const d of due) {
+      const state = await this.haFetchState(d.entity);
+      this.state.haState[d.entity] = { state, at: this.now() };
+      this.applyHaState(page, d.idx, d.hs, state);
+      this.changed();
+    }
+  }
+
+  private async haFetchState(entity: string): Promise<string> {
+    const c = this.haCreds();
+    if (!c) return 'unavailable';
+    try {
+      const r = await this.o.fetchImpl(`${c.base}/api/states/${encodeURIComponent(entity)}`, {
+        headers: { Authorization: `Bearer ${c.token}` }, signal: AbortSignal.timeout(this.o.haTimeoutMs),
+      });
+      if (!r.ok) return 'unavailable';
+      const j = (await r.json()) as { state?: unknown };
+      return typeof j.state === 'string' ? j.state : 'unavailable';
+    } catch { return 'unavailable'; }
+  }
+
+  private applyHaState(page: number, idx: number, hs: Record<string, any>, state: string): void {
+    const col = (v: unknown) => (typeof v === 'string' && HEX6.test(v) ? v.toLowerCase() : null);
+    const lab = (v: unknown) => (typeof v === 'string' && v.length <= 24 ? v : null);
+    if (state === 'on') this.liveMerge(page, idx, { btnColor: col(hs.on), label: lab(hs.label_on) });
+    else if (state === 'off') this.liveMerge(page, idx, { btnColor: col(hs.off), label: lab(hs.label_off) });
+    else this.liveMerge(page, idx, { btnColor: HA_UNAVAILABLE_COLOR, label: '?' });
+  }
+
+  private track(p: Promise<unknown>): void {
+    const t: Promise<unknown> = p.catch(() => {}).finally(() => this.tasks.delete(t));
+    this.tasks.add(t);
+  }
+
+  /** Resolves when no Home Assistant poll or standalone ha/http request is in flight (for tests and scripts). */
+  async idle(): Promise<void> {
+    for (;;) {
+      await Promise.all([this.haChain, ...this.tasks]);
+      if (this.tasks.size === 0) return;
+    }
+  }
+
+  /** Run an ha/http button on the deck itself (standalone routing). Result goes to the deck log; secrets never do. */
+  private runStandaloneNet(page: number, idx: number, b: Record<string, any>): boolean {
+    if (b.type === 'ha') { this.track(this.standaloneHa(page, idx, b)); return true; }
+    if (b.type === 'http') { this.track(this.standaloneHttp(b)); return true; }
+    return false;
+  }
+
+  private async standaloneHa(page: number, idx: number, b: Record<string, any>): Promise<void> {
+    const ha = b.ha ?? {};
+    const c = this.haCreds();
+    if (!c) return this.log('ha: not configured (ha_url + ha_token via SET_NET)');
+    if (typeof ha.service !== 'string' || !SERVICE_RE.test(ha.service)) return this.log('ha: bad service name');
+    const [domain, service] = ha.service.split('.');
+    const body: Record<string, unknown> = {};
+    if (typeof ha.entity === 'string' && ENTITY_RE.test(ha.entity)) body.entity_id = ha.entity;
+    if (ha.data && typeof ha.data === 'object' && !Array.isArray(ha.data)) Object.assign(body, ha.data);
+    try {
+      const r = await this.o.fetchImpl(`${c.base}/api/services/${domain}/${service}`, {
+        method: 'POST', headers: { Authorization: `Bearer ${c.token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify(body), signal: AbortSignal.timeout(this.o.haTimeoutMs),
+      });
+      this.log(`ha ${ha.service}${body.entity_id ? ' ' + body.entity_id : ''} -> HTTP ${r.status}`);
+    } catch { this.log(`ha ${ha.service} -> failed (network/timeout)`); }
+    // refresh the button's state shortly after the press
+    const hs = b.ha_state;
+    if (hs && typeof hs.entity === 'string' && ENTITY_RE.test(hs.entity)) {
+      const t = setTimeout(() => {
+        if (this.haPollEligible() && this.state.page === page)
+          this.haChain = this.haChain.then(() => this.haPollEntities(page, [{ idx, entity: hs.entity, hs }])).catch(() => {});
+      }, this.o.haRepollMs);
+      t.unref?.();
+    }
+  }
+
+  private async standaloneHttp(b: Record<string, any>): Promise<void> {
+    const h = b.http ?? {};
+    if (typeof h.url !== 'string' || !/^https?:\/\/[^\s]+$/.test(h.url)) return this.log('http: bad url');
+    const method = String(h.method ?? 'GET').toUpperCase();
+    if (!['GET', 'POST', 'PUT', 'DELETE', 'PATCH'].includes(method)) return this.log('http: bad method');
+    const headers: Record<string, string> = {};
+    if (h.headers && typeof h.headers === 'object') for (const [k, v] of Object.entries(h.headers).slice(0, 8)) if (typeof v === 'string') headers[k] = v;
+    let where = 'host';
+    try { where = new URL(h.url).host; } catch { /* validated above */ }
+    try {
+      const r = await this.o.fetchImpl(h.url, {
+        method, headers, body: method === 'GET' || typeof h.body !== 'string' ? undefined : h.body.slice(0, 1024), signal: AbortSignal.timeout(this.o.haTimeoutMs),
+      });
+      this.log(`http ${method} ${where} -> HTTP ${r.status}`);
+    } catch { this.log(`http ${method} ${where} -> failed (network/timeout)`); }
   }
 
   private alertCmd(arg: string): void {
@@ -665,7 +914,9 @@ export class DeckEmulator extends EventEmitter {
   }
 
   private gotoPage(p: number): void {
-    this.state.page = p; this.resetToggles(p); this.changed();
+    this.state.page = p; this.resetToggles(p);
+    for (const k of [...this.haNext.keys()]) if (k.startsWith(`${p}:`)) this.haNext.delete(k); // poll the new page's HA buttons right away
+    this.changed();
   }
 
   /** Touch anywhere while an alert is active acknowledges it (and is swallowed). */
@@ -746,6 +997,12 @@ export class DeckEmulator extends EventEmitter {
         s.toggles[k] = !this.toggleState(page, index);
         return this.sendPress(page, index, b, s.toggles[k] ? 1 : 0);
       }
+      case 'blehost': {
+        // device-local like goto: runs on the deck every time, never reported to the host as BTN
+        const r = this.bleHost(typeof b.slot === 'string' && /^[123]$/.test(b.slot) ? Number(b.slot) : b.slot);
+        if (!r.ok) this.log(`blehost: ${r.err}`);
+        return { action: 'blehost' };
+      }
       case 'none':
         return { action: 'none' };
       default:
@@ -758,7 +1015,7 @@ export class DeckEmulator extends EventEmitter {
     const standalone = mode === 'always' || (mode === 'auto' && !this.hostActive());
     if (standalone) {
       const what = `${b.type}${b.combo ? ' ' + b.combo : ''}${b.text ? ' "' + b.text + '"' : ''}${b.media ? ' ' + b.media : ''}${b.ha?.service ? ' ' + b.ha.service : ''}`;
-      this.log(`would run on deck: ${what.trim()} (button ${page}:${index})`);
+      if (!this.runStandaloneNet(page, index, b)) this.log(`would run on deck: ${what.trim()} (button ${page}:${index})`);
       this.emit('standalone', { page, index, button: b });
       return { action: 'standalone' };
     }
@@ -795,7 +1052,9 @@ export class DeckEmulator extends EventEmitter {
   /** Simulate a BLE central connecting/disconnecting. */
   setBlePeer(peer: string): void {
     if (!this.state.ble.enabled) return;
-    this.state.ble.peer = peer.slice(0, 40);
+    const b = this.state.ble;
+    b.peer = peer.slice(0, 40);
+    if (b.peer) { b.bonds[b.slot - 1] = true; this.savePrefs(); } // a host that connects bonds to the current slot's identity
     this.emitNetStatus(false);
     this.changed();
   }

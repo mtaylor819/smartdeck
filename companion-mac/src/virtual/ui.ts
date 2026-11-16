@@ -92,6 +92,11 @@ export function startVirtualUi(deck: DeckEmulator, dataDir: string, opts: { port
           case '/api/sleep': deck.sleepNow(); return json(res, 200, { ok: true });
           case '/api/ble': deck.setBlePeer(typeof b.peer === 'string' ? b.peer : ''); return json(res, 200, { ok: true });
           case '/api/lux': deck.setLux(num(b.lux, 'lux', 0, 200000)); return json(res, 200, { ok: true });
+          case '/api/ble-slot': {
+            // same effect as pressing a `blehost` button on the deck
+            if (!(b.slot === 1 || b.slot === 2 || b.slot === 3 || b.slot === 'next')) throw new HttpError(400, 'slot must be 1, 2, 3 or "next"');
+            return json(res, 200, deck.bleHost(b.slot));
+          }
         }
       }
       return json(res, 404, { error: 'not found' });
