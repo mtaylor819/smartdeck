@@ -7,8 +7,14 @@
 //  * Disabled until configured: stock behaviour is unchanged until `SET_BLE:{"enabled":true}` arrives (persisted in
 //    Preferences namespace "ble": en / name).
 //  * Just-Works pairing with bonding (bonds persisted by NimBLE in NVS), advertises as a keyboard (appearance 0x03C1).
-//  * ble_button(): runs type key / text / media buttons over BLE, only while a host is connected. Typing is queued and
-//    pumped from ble_loop() (never blocks).
+//  * v4 PAIRING SAFETY (companion-mac/PROTOCOL.md "BLE pairing safety"): Just Works has no MITM protection, so pairing is only
+//    allowed inside a short PAIRING WINDOW (auto 120 s the first time BLE runs with no bonds; BLE_PAIR:<seconds>; a "blepair" button).
+//    Outside it bonding is switched off, so a stranger cannot create a bond. A link is APPROVED only when encrypted+bonded
+//    (ble_pairing.h); unapproved links are disconnected (encrypted at once, others after 15 s), and HID reports are never sent while
+//    ANY encrypted-but-unapproved link exists (NimBLE notifies every encrypted subscriber). So a stranger can neither read keystrokes
+//    nor hold the connection. Not done: numeric-comparison confirmation on screen (the window + indicator is the mitigation).
+//  * ble_button(): runs type key / text / media buttons over BLE, only while an APPROVED host is connected AND subscribed.
+//    Typing is queued and pumped from ble_loop() (never blocks).
 //  * Host slots (v3, fork "fw-blehost"): 3 slots, each its own BLE identity so every machine bonds separately; BLE_HOST:<n|next>
 //    switches (drops the current host, advertises as the new slot); type "blehost" buttons do the same on the deck itself.
 //  * Radio note: WiFi and BLE share the one 2.4 GHz radio; the ESP32 coexistence layer time-slices them. Expect slightly
@@ -21,12 +27,17 @@
 #include <esp_system.h>      // esp_efuse_mac_get_default (stable per-chip seed for the slot identities)
 #include "ble_keys.h"
 #include "ble_slots.h"
+#include "ble_report_map.h"
+#include "ble_pairing.h"
+
+bool alert_is_active();   // led_alert.h (included after this header): don't paint the pairing indicator over an alert banner
 
 // ---- Cross-module API used by net_wifi.h (CONTRACT, keep these signatures) -------------------------------------
 enum BleState : uint8_t { BLE_ST_OFF = 0, BLE_ST_ADV = 1, BLE_ST_CONN = 2 };
 
+// BLE_ST_CONN means an APPROVED (encrypted + bonded) host is connected, not merely that something connected.
 static volatile BleState ble_st = BLE_ST_OFF;
-static char ble_peer[20] = "";
+static char ble_peer[20] = "";   // written ONLY by the main loop (staged from the NimBLE task via ble_ok_peer), so no torn reads
 
 // ---- Host slots (v3): one deck, up to 3 machines. Each slot has its own BLE identity so each host bonds separately. ----
 // Slot 1 keeps the chip's PUBLIC address (so bonds made with the pre-slot firmware keep working); slots 2/3 use a stable
@@ -63,27 +74,30 @@ static volatile bool ble_status_dirty = false;   // set from NimBLE callbacks; m
 static bool ble_clear_bonds_pending = false;     // SET_BLE clear_bonds:true while stack was down (all slots)
 static unsigned long ble_last_adv_check = 0;
 
+// ---- Pairing window + link approval (v4) -----------------------------------------------------------------------
+static BlePairWindow ble_pair;                   // main loop only
+static bool ble_auto_used = false;               // persisted ("ble"/"pw1"): the automatic first-time window has been used
+static uint8_t ble_sec_ver = 0;                  // persisted ("ble"/"sv"): firmware security version that last ran
+static unsigned long ble_pair_last_draw = 0;     // millis() of the last indicator paint (1 Hz while the window is open)
+static bool ble_pair_drawn = false;              // an indicator is (possibly) on screen and must be wiped when the window closes
+static volatile bool ble_pair_close_req = false; // set when an approved NEW bond finished (NimBLE task): close the window early
+static volatile bool ble_window_v = false;       // mirror of ble_pair.open for the NimBLE task (the main loop keeps it current)
+
+// Links the NimBLE stack currently reports, with their approval state. Written by the NimBLE host task (callbacks) and read by the
+// main loop, so every access takes ble_mux.
+#define BLE_MAX_LINKS 3
+struct BleLink { uint16_t h; uint32_t t0; bool ok; bool used; };
+static BleLink ble_links[BLE_MAX_LINKS];
+static portMUX_TYPE ble_mux = portMUX_INITIALIZER_UNLOCKED;
+static uint8_t ble_ok_peer[7];                   // identity address of the newest approved peer (staged for the main loop)
+static volatile bool ble_ok_peer_pending = false;
+
 static NimBLEServer* ble_server = nullptr;
 static NimBLEHIDDevice* ble_hid = nullptr;
 static NimBLECharacteristic* ble_kb_in = nullptr;      // report ID 1: keyboard
 static NimBLECharacteristic* ble_media_in = nullptr;   // report ID 2: consumer control
 
-// HID report map: keyboard (ID 1: 1 modifier byte, 1 reserved, 6 key slots, LED output) + consumer control (ID 2: one 16-bit usage).
-static const uint8_t BLE_REPORT_MAP[] = {
-  0x05, 0x01, 0x09, 0x06, 0xA1, 0x01, 0x85, 0x01,          // Usage Page (Generic Desktop), Usage (Keyboard), Collection, Report ID 1
-  0x05, 0x07, 0x19, 0xE0, 0x29, 0xE7, 0x15, 0x00, 0x25, 0x01,
-  0x75, 0x01, 0x95, 0x08, 0x81, 0x02,                      // 8 modifier bits (Input)
-  0x95, 0x01, 0x75, 0x08, 0x81, 0x01,                      // reserved byte
-  0x95, 0x05, 0x75, 0x01, 0x05, 0x08, 0x19, 0x01, 0x29, 0x05, 0x91, 0x02,  // 5 LED bits (Output)
-  0x95, 0x01, 0x75, 0x03, 0x91, 0x01,                      // LED padding
-  0x95, 0x06, 0x75, 0x08, 0x15, 0x00, 0x25, 0x65,
-  0x05, 0x07, 0x19, 0x00, 0x29, 0x65, 0x81, 0x00,          // 6 key slots (Input, array)
-  0xC0,
-  0x05, 0x0C, 0x09, 0x01, 0xA1, 0x01, 0x85, 0x02,          // Usage Page (Consumer), Usage (Consumer Control), Report ID 2
-  0x15, 0x00, 0x26, 0xFF, 0x03, 0x19, 0x00, 0x2A, 0xFF, 0x03,
-  0x75, 0x10, 0x95, 0x01, 0x81, 0x00,                      // one 16-bit usage (Input, array)
-  0xC0
-};
+// HID report map: see ble_report_map.h (pure data: keyboard ID 1 with usages up to 0xE7 so F13-F24 work, consumer control ID 2).
 
 // ---- Outgoing event queue (combos / media) + text job -----------------------------------------------------------
 struct BleEv { uint8_t kind; uint8_t mods; uint8_t key; uint16_t usage; uint16_t gap_ms; };  // kind 0 = keyboard, 1 = media
@@ -124,6 +138,8 @@ static void ble_load() {
   Preferences p;
   if (!p.begin("ble", false)) return;
   ble_enabled = p.getBool("en", false);
+  ble_auto_used = p.getBool("pw1", false);
+  ble_sec_ver = p.getUChar("sv", 0);
   String n = p.getString("name", "SmartDeck");
   uint8_t cur = p.getUChar("cur", 1);
   ble_slot = (cur >= 1 && cur <= BLE_SLOT_COUNT) ? cur : 1;
@@ -151,6 +167,13 @@ static void ble_save() {
   }
   p.end();
 }
+static void ble_save_security_meta() {
+  Preferences p;
+  if (!p.begin("ble", false)) return;
+  p.putBool("pw1", ble_auto_used);
+  p.putUChar("sv", ble_sec_ver);
+  p.end();
+}
 // Remember which peer is bonded to a slot, so "clear this slot's bond" can find it later.
 static void ble_save_peer(int slot) {
   Preferences p;
@@ -161,26 +184,74 @@ static void ble_save_peer(int slot) {
 }
 
 // ---- NimBLE callbacks (run on the NimBLE host task: only set flags / copy small data here) ----------------------
+// Link table helpers. ble_mux must be held by the caller.
+static int ble_link_find_locked(uint16_t h) {
+  for (int i = 0; i < BLE_MAX_LINKS; i++) if (ble_links[i].used && ble_links[i].h == h) return i;
+  return -1;
+}
+static void ble_links_clear() {
+  portENTER_CRITICAL(&ble_mux);
+  for (int i = 0; i < BLE_MAX_LINKS; i++) ble_links[i].used = false;
+  portEXIT_CRITICAL(&ble_mux);
+}
+static int ble_links_count_ok() {
+  int n = 0;
+  portENTER_CRITICAL(&ble_mux);
+  for (int i = 0; i < BLE_MAX_LINKS; i++) if (ble_links[i].used && ble_links[i].ok) n++;
+  portEXIT_CRITICAL(&ble_mux);
+  return n;
+}
+static int ble_links_count_all() {
+  int n = 0;
+  portENTER_CRITICAL(&ble_mux);
+  for (int i = 0; i < BLE_MAX_LINKS; i++) if (ble_links[i].used) n++;
+  portEXIT_CRITICAL(&ble_mux);
+  return n;
+}
+
 class BleServerCb : public NimBLEServerCallbacks {
   void onConnect(NimBLEServer* s, ble_gap_conn_desc* desc) override {
-    NimBLEAddress a(desc->peer_ota_addr);
-    strncpy(ble_peer, a.toString().c_str(), sizeof(ble_peer) - 1);
-    ble_peer[sizeof(ble_peer) - 1] = 0;
-    ble_st = BLE_ST_CONN;
+    // A new link is UNAPPROVED until it completes encryption with a bond (see onAuthenticationComplete). It is NOT reported as
+    // "connected" and receives nothing; if it does not get approved within BLE_UNAUTH_KICK_MS the main loop drops it.
+    portENTER_CRITICAL(&ble_mux);
+    int i = ble_link_find_locked(desc->conn_handle);
+    if (i < 0) for (int k = 0; k < BLE_MAX_LINKS; k++) if (!ble_links[k].used) { i = k; break; }
+    if (i >= 0) { ble_links[i].used = true; ble_links[i].h = desc->conn_handle; ble_links[i].t0 = millis(); ble_links[i].ok = false; }
+    portEXIT_CRITICAL(&ble_mux);
     ble_status_dirty = true;
   }
-  void onDisconnect(NimBLEServer* s) override {
-    ble_peer[0] = 0;
-    ble_st = ble_running ? BLE_ST_ADV : BLE_ST_OFF;   // NimBLEServer re-advertises on disconnect by default
-    ble_status_dirty = true;
+  void onDisconnect(NimBLEServer* s, ble_gap_conn_desc* desc) override {
+    portENTER_CRITICAL(&ble_mux);
+    int i = ble_link_find_locked(desc->conn_handle);
+    if (i >= 0) ble_links[i].used = false;
+    portEXIT_CRITICAL(&ble_mux);
+    ble_status_dirty = true;                       // main loop recomputes ble_st / peer; NimBLEServer re-advertises on disconnect
   }
   void onAuthenticationComplete(ble_gap_conn_desc* desc) override {
-    // Pairing/encryption finished. If the link is bonded, remember the peer's IDENTITY address for the current slot
-    // (persisted from the main loop, not here: this runs on the NimBLE task).
-    if (desc && desc->sec_state.encrypted && desc->sec_state.bonded) {
-      ble_bond_peer_tmp[0] = desc->peer_id_addr.type;
-      memcpy(ble_bond_peer_tmp + 1, desc->peer_id_addr.val, 6);
+    // Encryption finished (new pairing OR re-encryption of an existing bond). Runs on the NimBLE task: stage data, don't draw.
+    if (!desc) return;
+    bool enc = desc->sec_state.encrypted, bonded = desc->sec_state.bonded;
+    // The bonded flag's timing on a brand-new bond is unverified (no hardware): also consult the bond store for the peer's identity.
+    if (enc && !bonded) bonded = NimBLEDevice::isBonded(NimBLEAddress(desc->peer_id_addr));
+    if (ble_auth_verdict(enc, bonded, ble_window_v) == BLE_V_ACCEPT) {
+      portENTER_CRITICAL(&ble_mux);
+      int i = ble_link_find_locked(desc->conn_handle);
+      if (i >= 0) ble_links[i].ok = true;
+      ble_ok_peer[0] = desc->peer_id_addr.type;
+      memcpy(ble_ok_peer + 1, desc->peer_id_addr.val, 6);
+      ble_ok_peer_pending = true;
+      portEXIT_CRITICAL(&ble_mux);
+      // remember the peer for the current slot ("clear this slot's bond"); a NEW peer (not the slot's known host) also closes the
+      // pairing window, so one window pairs one host. An existing host reconnecting must not close a window opened for a second one.
+      bool isNew = memcmp(ble_slot_peer[ble_slot - 1], ble_ok_peer, 7) != 0;
+      memcpy(ble_bond_peer_tmp, ble_ok_peer, 7);
       ble_bond_pending = true;
+      if (isNew) ble_pair_close_req = true;
+      ble_status_dirty = true;
+    } else {
+      // Not (encrypted AND bonded): a stranger (bonding is off outside the pairing window) or a failed attempt. Drop it NOW so it can
+      // neither receive reports nor occupy the connection. (Calling terminate from the host task is the documented way.)
+      ble_gap_terminate(desc->conn_handle, BLE_ERR_REM_USER_CONN_TERM);
     }
   }
 };
@@ -222,15 +293,71 @@ static bool ble_delete_slot_bond(int slot) {
   return ok;
 }
 
+// ---- Pairing window (v4) ----------------------------------------------------------------------------------------
+// Bonding is only switched ON while the window is open (ble_hs_cfg.sm_bonding is read by NimBLE when a pairing starts, so it can be
+// flipped at run time; verified in NimBLEDevice::setSecurityAuth). Outside the window a stranger's pairing completes WITHOUT a bond,
+// which ble_auth_verdict() rejects, and re-encryption of existing bonds (stored LTK) is unaffected.
+static void ble_apply_security(bool bonding) {
+  NimBLEDevice::setSecurityAuth(bonding, false, true);       // bonding?, no MITM (Just Works), LE Secure Connections
+  NimBLEDevice::setSecurityIOCap(BLE_HS_IO_NO_INPUT_OUTPUT);
+}
+
+// Orange LCARS pill in the header strip (same spot/style as the alert banner and the slot toast), repainted at 1 Hz while open.
+static void ble_pair_draw_indicator(uint32_t secs) {
+  if (is_sleeping || is_deep_sleeping || alert_is_active()) return;   // nobody looking / an alert banner owns the header
+  if (ble_toast_until) return;                                        // the slot toast owns the header for 1.5 s
+  const int x = 8, y = 5, h = 40, w = screenWidth - 16;
+  gfx->fillRoundRect(x, y, w, h, h / 2, gfx->color565(255, 153, 0));
+  gfx->setTextSize(3);
+  gfx->setTextColor(0x0000);
+  gfx->setCursor(x + 28, y + 8);
+  gfx->print("BT PAIRING  ");
+  gfx->print((int)secs);
+  gfx->print("s");
+  gfx->setTextSize(2);
+  ble_pair_drawn = true;
+}
+
+static void ble_pair_open_window(uint32_t seconds) {
+  ble_pair.start(millis(), seconds);
+  ble_window_v = true;
+  if (ble_running) ble_apply_security(true);
+  ble_pair_last_draw = 0;                                   // paint immediately on the next loop
+  ble_status_dirty = true;
+  Serial.printf("BLE: pairing window open for %us\n", (unsigned)seconds);
+}
+
+static void ble_pair_close_window(bool redraw) {
+  bool was = ble_pair.open;
+  ble_pair.close();
+  ble_window_v = false;
+  if (ble_running) ble_apply_security(false);
+  if (ble_pair_drawn) {
+    ble_pair_drawn = false;
+    if (redraw && !is_sleeping && !is_deep_sleeping) draw_page(current_page);   // wipe the indicator (toggle states survive: toggle_table.h)
+  }
+  if (was) Serial.println("BLE: pairing window closed");
+  ble_status_dirty = true;
+}
+
 // ---- Start / stop -----------------------------------------------------------------------------------------------
 static void ble_start() {
   if (ble_running) return;
   NimBLEDevice::init(ble_name);
-  NimBLEDevice::setSecurityAuth(true, false, true);          // bonding, no MITM (Just Works), LE Secure Connections
-  NimBLEDevice::setSecurityIOCap(BLE_HS_IO_NO_INPUT_OUTPUT);
+  ble_apply_security(ble_pair.isOpen(millis()));            // bonding OFF unless a pairing window is open
+  if (ble_sec_ver < BLE_SECURITY_VERSION) {                 // one-time purge: bonds made by the old always-open firmware are not trusted
+    NimBLEDevice::deleteAllBonds();
+    for (int i = 0; i < BLE_SLOT_COUNT; i++) { memset(ble_slot_peer[i], 0, 7); ble_save_peer(i + 1); }
+    ble_auto_used = false;
+    ble_sec_ver = BLE_SECURITY_VERSION;
+    ble_save_security_meta();
+    Serial.println("BLE: security v4: old bonds purged, hosts must pair again");
+  }
   if (ble_clear_bonds_pending) {
     NimBLEDevice::deleteAllBonds(); ble_clear_bonds_pending = false; ble_clear_slot_mask = 0;
     for (int i = 0; i < BLE_SLOT_COUNT; i++) { memset(ble_slot_peer[i], 0, 7); ble_save_peer(i + 1); }
+    ble_auto_used = false;                                  // bonds are gone: the automatic first-time window may open again
+    ble_save_security_meta();
   }
   for (int s = 1; s <= BLE_SLOT_COUNT; s++) if (ble_clear_slot_mask & (1 << (s - 1))) ble_delete_slot_bond(s);
   ble_clear_slot_mask = 0;
@@ -258,6 +385,11 @@ static void ble_start() {
   ble_running = true;
   ble_st = BLE_ST_ADV;
   ble_status_dirty = true;
+  if (ble_auto_window_wanted(NimBLEDevice::getNumBonds(), ble_auto_used)) {   // first time BLE runs with no bonds: let the user pair once
+    ble_auto_used = true;
+    ble_save_security_meta();
+    ble_pair_open_window(BLE_PAIR_AUTO_SECONDS);
+  }
   Serial.printf("BLE: advertising as \"%s\" slot %d (%s) (bonds: %d, free heap %u)\n", ble_name, ble_slot, ble_slot_names[ble_slot - 1], NimBLEDevice::getNumBonds(), (unsigned)ESP.getFreeHeap());
 }
 
@@ -271,6 +403,9 @@ static void ble_stop() {
   ble_running = false;
   ble_st = BLE_ST_OFF;
   ble_peer[0] = 0;
+  ble_links_clear();
+  ble_pair.close();                  // a window never survives a stack restart (slot switch / rename / disable)
+  ble_window_v = false;
   ble_status_dirty = true;
   Serial.println("BLE: stopped");
 }
@@ -281,9 +416,28 @@ void ble_setup() {
   if (ble_enabled) ble_start();
 }
 
+// May HID reports go out right now? Yes only if an APPROVED link exists and no encrypted-but-unapproved link exists
+// (NimBLE's notify() delivers to EVERY encrypted subscriber; unencrypted subscribers are already skipped by the library because the
+// input-report characteristic is READ_ENC, verified in NimBLECharacteristic::notify). No heap use: walks our 3-entry link table.
+static bool ble_send_gate() {
+  int approved = 0, encUnapproved = 0;
+  for (int i = 0; i < BLE_MAX_LINKS; i++) {
+    BleLink l;
+    portENTER_CRITICAL(&ble_mux);
+    l = ble_links[i];
+    portEXIT_CRITICAL(&ble_mux);
+    if (!l.used) continue;
+    if (l.ok) { approved++; continue; }
+    ble_gap_conn_desc d;
+    if (ble_gap_conn_find(l.h, &d) == 0 && d.sec_state.encrypted) encUnapproved++;
+  }
+  return ble_send_allowed(approved, encUnapproved);
+}
+
 static bool ble_notify_kb(uint8_t mods, uint8_t key) {
   if (!ble_kb_in) return false;
   uint8_t r[8] = { mods, 0, key, 0, 0, 0, 0, 0 };
+  if (!ble_send_gate()) return false;                        // never type into an unapproved/stranger link
   if (ble_kb_in->getSubscribedCount() == 0) return false;   // host hasn't enabled notifications yet (pairing in progress)
   ble_kb_in->setValue(r, sizeof(r));
   ble_kb_in->notify();                                       // NimBLE 1.4.3: void, no delivery feedback
@@ -292,6 +446,7 @@ static bool ble_notify_kb(uint8_t mods, uint8_t key) {
 static bool ble_notify_media(uint16_t usage) {
   if (!ble_media_in) return false;
   uint8_t r[2] = { (uint8_t)(usage & 0xFF), (uint8_t)(usage >> 8) };
+  if (!ble_send_gate()) return false;
   if (ble_media_in->getSubscribedCount() == 0) return false;
   ble_media_in->setValue(r, sizeof(r));
   ble_media_in->notify();
@@ -336,6 +491,27 @@ static void ble_switch_slot(int n) {
 }
 
 void ble_loop() {
+  unsigned long now = millis();
+
+  // The approved peer's address was staged by the NimBLE task; only the main loop ever writes ble_peer (no torn reads).
+  if (ble_ok_peer_pending) {
+    uint8_t pr[7];
+    portENTER_CRITICAL(&ble_mux);
+    memcpy(pr, ble_ok_peer, 7);
+    ble_ok_peer_pending = false;
+    portEXIT_CRITICAL(&ble_mux);
+    ble_addr_t ba;
+    ba.type = pr[0];
+    memcpy(ba.val, pr + 1, 6);
+    strncpy(ble_peer, NimBLEAddress(ba).toString().c_str(), sizeof(ble_peer) - 1);
+    ble_peer[sizeof(ble_peer) - 1] = 0;
+    ble_status_dirty = true;
+  }
+  // "connected" = an APPROVED host. Recomputed from the link table, so a stranger's idle link never shows as connected.
+  {
+    BleState ns = !ble_running ? BLE_ST_OFF : (ble_links_count_ok() > 0 ? BLE_ST_CONN : BLE_ST_ADV);
+    if (ns != ble_st) { ble_st = ns; if (ns != BLE_ST_CONN) ble_peer[0] = 0; ble_status_dirty = true; }
+  }
   if (ble_status_dirty) {                 // tell the net module (emits NET_STATUS, rate-limited there)
     ble_status_dirty = false;
     net_status_changed();
@@ -345,16 +521,39 @@ void ble_loop() {
     ble_toast_until = 0;
     if (!is_sleeping && !is_deep_sleeping) draw_page(current_page);       // remove the toast (the alert banner self-heals if active)
   }
-  if (!ble_running) return;
-  unsigned long now = millis();
 
-  if (ble_st != BLE_ST_CONN) {            // not connected: drop anything pending, make sure we're advertising
+  // Pairing window: close early after a NEW host paired, expire on time, repaint the indicator at 1 Hz, stay awake while it is open.
+  if (ble_pair_close_req) { ble_pair_close_req = false; if (ble_pair.open) ble_pair_close_window(true); }
+  if (ble_pair.open) {
+    if (!ble_pair.isOpen(now)) {
+      ble_pair_close_window(true);
+    } else {
+      last_activity_time = now;           // the user is pairing: don't dim/sleep under them (same trick as the alert)
+      if (now - ble_pair_last_draw >= 1000) { ble_pair_last_draw = now; ble_pair_draw_indicator(ble_pair.remainingSec(now)); }
+    }
+  }
+  if (!ble_running) return;
+
+  // Drop links that never got approved (a stranger sitting on the connection). Encrypted-but-unbonded ones were already terminated
+  // in onAuthenticationComplete; this catches peers that connect and then do nothing.
+  if (ble_server) {
+    for (int i = 0; i < BLE_MAX_LINKS; i++) {
+      BleLink l;
+      portENTER_CRITICAL(&ble_mux);
+      l = ble_links[i];
+      if (l.used && ble_link_expired(l.ok, l.t0, (uint32_t)now)) ble_links[i].t0 = (uint32_t)now;   // retry in another 15 s if it lingers
+      portEXIT_CRITICAL(&ble_mux);
+      if (l.used && ble_link_expired(l.ok, l.t0, (uint32_t)now)) ble_server->disconnect(l.h);
+    }
+  }
+
+  if (ble_st != BLE_ST_CONN) {            // no approved host: drop anything pending, make sure we're advertising
     if (ble_q_count || ble_text.length()) ble_queue_clear();
     if (now - ble_last_adv_check > 2000) {
       ble_last_adv_check = now;
       NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
-      if (!adv->isAdvertising()) { adv->start(); }
-      if (ble_st != BLE_ST_ADV) { ble_st = BLE_ST_ADV; ble_status_dirty = true; }
+      // keep advertising while only unapproved links exist, so a stranger idling on one slot cannot lock the real host out
+      if (!adv->isAdvertising() && ble_links_count_all() < BLE_MAX_LINKS) { adv->start(); }
     }
     return;
   }
@@ -401,6 +600,17 @@ void ble_loop() {
 }
 
 bool ble_command(const String& c) {
+  if (c.startsWith("BLE_PAIR:")) {                         // BLE_PAIR:<1..300>  open the pairing window for that many seconds
+    if (!ble_enabled) { Serial.println("BLE_PAIR:err:ble_off"); return true; }
+    int secs = 0;
+    String arg = c.substring(9);
+    arg.trim();
+    if (!ble_pair_parse_seconds(arg.c_str(), &secs)) { Serial.println("BLE_PAIR:err:bad_seconds"); return true; }
+    if (!ble_running) ble_start();                          // enabled but stack down (shouldn't happen): bring it up first
+    ble_pair_open_window((uint32_t)secs);
+    Serial.printf("BLE_PAIR:%d\n", secs);
+    return true;
+  }
   if (c.startsWith("BLE_HOST:")) {                         // BLE_HOST:<1|2|3|next>
     if (!ble_enabled) { Serial.println("BLE_HOST:err:ble_off"); return true; }
     int n = ble_slot_parse_arg(c.substring(9).c_str(), ble_slot);
@@ -458,6 +668,8 @@ bool ble_command(const String& c) {
     if (ble_running) {
       NimBLEDevice::deleteAllBonds();
       for (int i = 0; i < BLE_SLOT_COUNT; i++) { memset(ble_slot_peer[i], 0, 7); ble_save_peer(i + 1); }
+      ble_auto_used = false;                                    // no bonds left: the automatic first-time window may open at next start
+      ble_save_security_meta();
     } else ble_clear_bonds_pending = true;                      // applied at next start
   } else if (clearSlot) {
     if (ble_running) ble_delete_slot_bond(clearSlot); else ble_clear_slot_mask |= (uint8_t)(1 << (clearSlot - 1));
@@ -471,6 +683,12 @@ bool ble_command(const String& c) {
 // (like "goto"; hooked at the top of send_pc_command in smart_deck.ino). Returns true if it consumed the press.
 bool ble_local_button(JsonObject cfg) {
   const char* type = cfg["type"] | "";
+  if (strcmp(type, "blepair") == 0) {                      // {"type":"blepair"}: open the pairing window (120 s) from the deck itself
+    if (!ble_enabled) { Serial.println("BLE: blepair pressed but Bluetooth is disabled (SET_BLE enabled)"); return true; }
+    if (!ble_running) ble_start();
+    ble_pair_open_window(BLE_PAIR_AUTO_SECONDS);
+    return true;
+  }
   if (strcmp(type, "blehost") != 0) return false;
   int n = 0;
   JsonVariant s = cfg["slot"];
@@ -486,6 +704,12 @@ bool ble_local_button(JsonObject cfg) {
 bool ble_button(JsonObject cfg, int page, int idx, bool hasState, bool state) {
   if (!ble_running || ble_st != BLE_ST_CONN) return false;     // let the other modules / host path handle it
   const char* type = cfg["type"] | "";
+  // M5: "connected" is not enough. If the approved host has not subscribed to the report we would send to (right after connect, or iOS
+  // unsubscribing while idle) the press would be queued and then dropped after ~0.6 s, and returning true would also stop the
+  // WiFi/Home Assistant fallback from running. Only claim the press when the host can actually receive it.
+  bool isMedia = strcmp(type, "media") == 0;
+  NimBLECharacteristic* rep = isMedia ? ble_media_in : ble_kb_in;
+  if ((strcmp(type, "key") == 0 || strcmp(type, "text") == 0 || isMedia) && (!rep || rep->getSubscribedCount() == 0)) return false;
 
   if (strcmp(type, "key") == 0) {
     const char* combo = cfg["combo"] | "";

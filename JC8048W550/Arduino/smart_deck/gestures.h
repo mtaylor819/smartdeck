@@ -16,6 +16,14 @@
 
 static GestureCfg g_gest_cfg;
 static GestureTracker g_gest_tracker;
+static bool g_hold_consumed = false;  // M2: BTN_HOLD fired for this touch: swallow the rest of it (no slide-onto-a-neighbour press)
+
+// Forget any touch in progress. Called when something else (an alert) swallows the current touch, so the finger's later lift can't be
+// classified as a swipe or leave a stale hold behind.
+void gestures_reset() {
+  g_gest_tracker = GestureTracker();
+  g_hold_consumed = false;
+}
 
 // Does button `idx` on the current page have "hold":true? (called once per button the finger enters)
 static bool gesture_btn_has_hold(int idx) {
@@ -66,7 +74,17 @@ bool gestures_touch(bool touching, bool coordValid, int tx, int ty, int btn, uns
     if (!long_press_triggered) {
       Serial.printf("BTN_HOLD:%d:%d\n", current_page, o.holdBtn);
       long_press_triggered = true;  // suppress the normal BTN on release (existing mechanism)
+      g_hold_consumed = true;
     }
+  }
+
+  // M2: after a hold fired, the press/hold chain must not run again for this touch. Without this, sliding from the held button onto a
+  // neighbour re-ran the "press" branch for the neighbour, cleared long_press_triggered, and released a normal BTN for it.
+  // While the finger is down we consume every poll; on the lift poll we fall through so the release branch restores the border
+  // (it sees long_press_triggered and sends nothing).
+  if (g_hold_consumed) {
+    if (touching) return true;
+    g_hold_consumed = false;
   }
 
   if (o.swipe != 0) {
@@ -80,7 +98,7 @@ bool gestures_touch(bool touching, bool coordValid, int tx, int ty, int btn, uns
       draw_page(current_page);
       Serial.printf("PAGE_CHANGED:%d\n", current_page);
     } else if (last_touched_button_index != -1) {
-      draw_page(current_page);  // clamped at first/last page: wipe the press highlight the swipe left behind
+      draw_page(current_page);  // clamped at first/last page: wipe the press highlight the swipe left behind (toggle states survive: toggle_table.h)
     }
     last_touched_button_index = -1;
     long_press_triggered = false;

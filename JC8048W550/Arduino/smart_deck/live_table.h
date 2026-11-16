@@ -135,6 +135,16 @@ static inline const LiveOv* live_find(int page, int idx) {
   return nullptr;
 }
 
+// L6: drop the override for one button. SET_BTN_DATA replaces what the button IS, so a stale live label/colour from the old button
+// (e.g. a removed CPU widget's last value) must not keep painting over the new one. Returns true if an entry was removed.
+static inline bool live_clear(int page, int idx) {
+  int16_t key = (int16_t)(page * 100 + idx);
+  bool had = false;
+  for (int i = 0; i < LIVE_MAX; i++)
+    if (live_tab[i].used && live_tab[i].key == key) { live_tab[i].used = false; had = true; }
+  return had;
+}
+
 static inline LiveOv* live_slot_for(int page, int idx) {
   int16_t key = (int16_t)(page * 100 + idx);
   int freeIdx = -1, oldest = 0;
