@@ -39,7 +39,7 @@ export interface VirtualDeckState {
   diag: { cpu: number; mem: number; disk: number; rx: number; tx: number; uptimeMin: number; host: string; at: number } | null;
   /** Non-secret view of provisioning. Secrets live in a private field and are never exposed. */
   net: { ssid: string; host: string; standalone: 'auto' | 'always' | 'never'; wifi: boolean; tz: string; hasPass: boolean; hasToken: boolean; hasHaUrl: boolean; hasHaToken: boolean };
-  ble: { enabled: boolean; name: string; peer: string; slot: number; slots: string[]; bonds: boolean[] };
+  ble: { enabled: boolean; name: string; peer: string; slot: number; slots: string[]; bonds: boolean[]; pairUntil: number };
   /** SET_BTN_LIVE overrides keyed "page:idx" (insertion order = age). RAM only: lost on reboot, never persisted. */
   live: Record<string, LiveOverride>;
   /** Brief on-screen message, e.g. "BT: Work PC". */
@@ -155,7 +155,7 @@ export class DeckEmulator extends EventEmitter {
       dimLed: 0, led: { r: 217, g: 70, b: 239, tail: 7, brightness: 255 }, knobRaw: 0,
       clock: { set: false, h: 0, m: 0, s: 0, setAt: 0 }, weather: null, diag: null,
       net: { ssid: '', host: 'smartdeck', standalone: 'auto', wifi: true, tz: '', hasPass: false, hasToken: false, hasHaUrl: false, hasHaToken: false },
-      ble: { enabled: false, name: 'SmartDeck', peer: '', slot: 1, slots: ['Host 1', 'Host 2', 'Host 3'], bonds: [false, false, false] }, alert: null,
+      ble: { enabled: false, name: 'SmartDeck', peer: '', slot: 1, slots: ['Host 1', 'Host 2', 'Host 3'], bonds: [false, false, false], pairUntil: 0 }, alert: null,
       live: {}, toast: null, haState: {},
       autodim: { enabled: false, min: 10, max: 100, luxLow: 5, luxHigh: 400, sensor: this.o.luxSensor, lux: 150 },
       gestures: { swipe: true, holdMs: 600 }, toggles: {}, counters: {}, timers: {},
@@ -534,6 +534,7 @@ export class DeckEmulator extends EventEmitter {
     if (line.startsWith('SET_BTN_DATA:')) return this.setBtnData(line);
     if (line.startsWith('SET_BTN_LIVE:')) return this.setBtnLive(line);
     if (line.startsWith('BLE_HOST:')) return this.bleHostCmd(arg('BLE_HOST:').trim());
+    if (line.startsWith('BLE_PAIR:')) return this.blePairCmd(arg('BLE_PAIR:').trim());
     if (line.startsWith('WEATHER:')) return this.weather(arg('WEATHER:'));
     if (line.startsWith('DIAG:')) return this.diag(arg('DIAG:'));
     if (line.startsWith('SET_SLEEP_SCREEN:')) {
@@ -663,7 +664,13 @@ export class DeckEmulator extends EventEmitter {
     if ('clear_bonds' in j && !(j.clear_bonds === true || (Number.isInteger(j.clear_bonds) && j.clear_bonds >= 1 && j.clear_bonds <= BLE_SLOTS)))
       return this.out('BLE_SET:err:bad_clear_bonds');
     if ('name' in j) b.name = j.name;
-    if ('enabled' in j) { b.enabled = j.enabled; if (!b.enabled) b.peer = ''; }
+    if ('enabled' in j) {
+      const turnedOn = j.enabled && !b.enabled;
+      b.enabled = j.enabled;
+      if (!b.enabled) { b.peer = ''; b.pairUntil = 0; }
+      // PROTOCOL.md v4: first enable with no bonds opens a 120 s pairing window automatically
+      else if (turnedOn && !b.bonds.some(Boolean)) b.pairUntil = this.now() + 120_000;
+    }
     if ('slots' in j) (j.slots as string[]).forEach((n, i) => { b.slots[i] = n; });
     if ('clear_bonds' in j) {
       if (j.clear_bonds === true) { b.bonds = [false, false, false]; b.peer = ''; }
@@ -689,6 +696,27 @@ export class DeckEmulator extends EventEmitter {
     this.changed();
     return { ok: true, slot: n };
   }
+
+  /** Open the BLE pairing window for `seconds` (1..300). Outside a window no NEW bonds are accepted (PROTOCOL.md v4). */
+  private openPairing(seconds: unknown): { ok: true; seconds: number } | { ok: false; err: string } {
+    const b = this.state.ble;
+    if (!b.enabled) return { ok: false, err: 'ble_off' };
+    const n = typeof seconds === 'string' && /^\d{1,3}$/.test(seconds) ? Number(seconds) : typeof seconds === 'number' ? seconds : NaN;
+    if (!Number.isInteger(n) || n < 1 || n > 300) return { ok: false, err: 'bad_seconds' };
+    b.pairUntil = this.now() + n * 1000;
+    this.state.toast = { text: 'BT: pairing open', until: this.now() + TOAST_MS };
+    this.changed();
+    return { ok: true, seconds: n };
+  }
+
+  private blePairCmd(arg: string): void {
+    const r = this.openPairing(arg);
+    this.out(r.ok ? `BLE_PAIR:${r.seconds}` : `BLE_PAIR:err:${r.err}`);
+    if (r.ok) this.emitNetStatus(false);
+  }
+
+  /** True while a pairing window is open (new bonds allowed). */
+  pairingOpen(): boolean { return this.state.ble.enabled && this.now() < this.state.ble.pairUntil; }
 
   private bleHostCmd(arg: string): void {
     const r = this.switchBleSlot(arg);
@@ -996,6 +1024,12 @@ export class DeckEmulator extends EventEmitter {
       case 'toggle': {
         s.toggles[k] = !this.toggleState(page, index);
         return this.sendPress(page, index, b, s.toggles[k] ? 1 : 0);
+      }
+      case 'blepair': {
+        // device-local like blehost: opens the pairing window, never reported to the host
+        const r = this.openPairing(typeof b.seconds === 'number' ? b.seconds : 120);
+        if (!r.ok) this.log(`blepair: ${r.err}`);
+        return { action: 'blepair' };
       }
       case 'blehost': {
         // device-local like goto: runs on the deck every time, never reported to the host as BTN

@@ -14,7 +14,7 @@ const d = await startVirtualDeck({
   log: (m) => console.log(`[deck] ${m}`),
 });
 console.log(`Virtual deck ready
-  host link : tcp://127.0.0.1:${d.tcpPort}   (first line: AUTH:${token})
+  host link : tcp://127.0.0.1:${d.tcpPort}   (token: ${token}; challenge-response, the token is never sent)
   screen    : ${d.uiUrl}`);
 const quit = async () => { await d.close(); process.exit(0); };
 process.on('SIGINT', quit);

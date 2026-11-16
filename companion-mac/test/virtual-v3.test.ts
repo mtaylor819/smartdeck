@@ -1,3 +1,4 @@
+import { handshake } from './helpers.js';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
@@ -564,7 +565,7 @@ test('over TCP: caps in NET_STATUS, SET_BTN_LIVE is silent, BLE_HOST replies', a
   const v = await startVirtualDeck({ port: 0, uiPort: 0, token: 'good-token-1', dataDir: dir });
   try {
     const c = await Raw.connect(v.tcpPort);
-    c.sock.write('AUTH:good-token-1\n'); await c.next((l) => l === 'AUTH_OK');
+    await handshake(c.sock, 'good-token-1');
     c.sock.write('GET_NET\n');
     const st = status(await c.next((l) => l.startsWith('NET_STATUS:')));
     assert.deepEqual(st.caps, ['btn_live', 'ha_state', 'ble_hosts']);
@@ -602,4 +603,18 @@ test('UI API: /api/ble-slot needs the CSRF token and a valid slot; /api/state ex
     const nx = await (await post({ slot: 'next' }, v.uiToken)).json();
     assert.deepEqual(nx, { ok: true, slot: 3 });
   } finally { await v.close(); }
+});
+
+test('BLE pairing window: BLE_PAIR opens it, auto-opens on first enable with no bonds, closes on expiry; blepair button is device-local', () => {
+  const l = emu({}, CONFIG);
+  let t = 1_000_000;
+  (l.deck as any).now = () => t;
+  l.send('BLE_PAIR:30'); assert.deepEqual(l.take(), ['BLE_PAIR:err:ble_off']);
+  l.send('SET_BLE:{"enabled":true}'); l.take();
+  assert.equal(l.deck.pairingOpen(), true, 'first enable with no bonds opens a 120 s window');
+  t += 121_000; assert.equal(l.deck.pairingOpen(), false);
+  l.send('BLE_PAIR:30'); assert.deepEqual(l.take().filter((x) => x.startsWith('BLE_PAIR')), ['BLE_PAIR:30']);
+  assert.equal(l.deck.pairingOpen(), true);
+  t += 31_000; assert.equal(l.deck.pairingOpen(), false);
+  for (const bad of ['0', '301', 'abc', '']) { l.send(`BLE_PAIR:${bad}`); assert.deepEqual(l.take().filter((x) => x.startsWith('BLE_PAIR')), ['BLE_PAIR:err:bad_seconds'], bad); }
 });

@@ -1,6 +1,8 @@
-// WiFi TCP host link (PROTOCOL.md): first line AUTH:<token>, then the normal line protocol both ways.
+// WiFi TCP host link (PROTOCOL.md v4): deck sends CHALLENGE:<nonce>, client answers AUTH:<hmac>, deck answers AUTH_OK:<hmac>;
+// then the normal line protocol both ways. The token itself never crosses the link.
 import { createHash, timingSafeEqual } from 'node:crypto';
 import { createServer, Server, Socket } from 'node:net';
+import { clientProof, ctEqualHex, deckProof, newNonce } from '../linkauth.js';
 import type { DeckEmulator } from './emulator.js';
 
 export interface TcpLinkOptions {
@@ -21,6 +23,8 @@ export interface TcpLink {
 
 const AUTH_WINDOW_MS = 5000;
 const MAX_PRE_AUTH_BYTES = 512;
+const MAX_PENDING = 3;
+const MAX_TRACKED_IPS = 8;
 
 /** Constant-time compare that doesn't leak the token length (hash both sides first). */
 export function tokenEquals(a: string, b: string): boolean {
@@ -35,8 +39,9 @@ export function startTcpLink(deck: DeckEmulator, opts: TcpLinkOptions): Promise<
   const lockoutMs = opts.lockoutMs ?? 30_000;
   const log = opts.log ?? (() => {});
   let client: Socket | null = null;
-  let fails = 0;
-  let lockedUntil = 0;
+  // Lockout is per source IP (LRU), so a hostile peer cannot lock out the real host.
+  const failTable = new Map<string, { fails: number; lockedUntil: number }>();
+  const pending: Socket[] = [];
   const sockets = new Set<Socket>();
 
   deck.setClientCounter(() => (client ? 1 : 0));
@@ -49,11 +54,26 @@ export function startTcpLink(deck: DeckEmulator, opts: TcpLinkOptions): Promise<
     client = null;
   });
 
+  const failsFor = (ip: string) => {
+    let e = failTable.get(ip);
+    if (!e) { e = { fails: 0, lockedUntil: 0 }; if (failTable.size >= MAX_TRACKED_IPS) failTable.delete(failTable.keys().next().value as string); }
+    failTable.delete(ip); failTable.set(ip, e); // move to most-recent
+    return e;
+  };
+
   const server: Server = createServer((sock) => {
     if (deck.state.rebooting) { sock.destroy(); return; }
+    const ip = sock.remoteAddress ?? '?';
+    if (failsFor(ip).lockedUntil > now()) { sock.end('AUTH_FAIL\r\n'); return; }
     sockets.add(sock);
-    sock.on('close', () => { sockets.delete(sock); if (client === sock) { client = null; deck.emit('change'); } });
+    sock.setKeepAlive(true, 10_000);
+    sock.on('close', () => { sockets.delete(sock); const i = pending.indexOf(sock); if (i >= 0) pending.splice(i, 1); if (client === sock) { client = null; deck.emit('change'); } });
     sock.on('error', () => sock.destroy());
+    // pending (unauthenticated) connections: at most MAX_PENDING, the oldest is evicted for a new one
+    pending.push(sock);
+    while (pending.length > MAX_PENDING) pending.shift()!.destroy();
+    const nonce = newNonce();
+    sock.write(`CHALLENGE:${nonce}\r\n`);
     let pre = Buffer.alloc(0);
     let authed = false;
     const timer = setTimeout(() => { if (!authed) sock.destroy(); }, AUTH_WINDOW_MS);
@@ -71,20 +91,22 @@ export function startTcpLink(deck: DeckEmulator, opts: TcpLinkOptions): Promise<
       const rest = pre.subarray(nl + 1);
       clearTimeout(timer);
 
-      const t = now();
-      const expected = deck.currentToken();
-      const given = line.startsWith('AUTH:') ? line.slice(5) : null;
-      if (t < lockedUntil) { sock.end('AUTH_FAIL\r\n'); return; }
-      if (given === null || !expected || !tokenEquals(given, expected)) {
-        if (++fails >= maxFails) { lockedUntil = t + lockoutMs; fails = 0; log('host link locked out after repeated AUTH failures'); }
+      const e = failsFor(ip);
+      const token = deck.currentToken();
+      const given = line.startsWith('AUTH:') ? line.slice(5) : '';
+      // always compare the full proof (fixed length) in constant time; no token => nobody can authenticate
+      const ok = !!token && ctEqualHex(given, clientProof(token, nonce));
+      if (!ok) {
+        if (++e.fails >= maxFails) { e.lockedUntil = now() + lockoutMs; e.fails = 0; log('host link locked out one address after repeated AUTH failures'); }
         sock.end('AUTH_FAIL\r\n');
         return;
       }
-      fails = 0;
+      e.fails = 0;
       authed = true;
+      const i = pending.indexOf(sock); if (i >= 0) pending.splice(i, 1);
       if (client && client !== sock) client.destroy(); // a new authenticated client replaces the old one
       client = sock;
-      sock.write('AUTH_OK\r\n');
+      sock.write(`AUTH_OK:${deckProof(token!, nonce)}\r\n`);
       log('host linked over TCP');
       deck.emit('change');
       if (rest.length) deck.feed(rest);

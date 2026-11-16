@@ -27,6 +27,7 @@ export type Action =
   | { type: 'ha'; service: string; entity?: string; data?: Record<string, unknown> }
   | { type: 'alert'; kind: 'red' | 'yellow' | 'blue' | 'green' | 'off'; seconds?: number; text?: string }
   | { type: 'blehost'; slot: 1 | 2 | 3 | 'next' }
+  | { type: 'blepair'; seconds?: number }
   | { type: 'none' };
 
 export type MediaKey =
@@ -179,6 +180,11 @@ export class ActionExecutor {
         return this.callHomeAssistant(action);
       case 'alert':
         return this.alert(action);
+      case 'blepair': {
+        const sec = action.seconds ?? 120;
+        if (!Number.isInteger(sec) || sec < 1 || sec > 300) throw new Error('blepair seconds must be 1-300');
+        return this.sendLine(`BLE_PAIR:${sec}`);
+      }
       case 'blehost':
         if (![1, 2, 3, 'next'].includes(action.slot as any)) throw new Error('blehost slot must be 1, 2, 3 or next');
         return this.sendLine(`BLE_HOST:${action.slot}`);

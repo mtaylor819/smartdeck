@@ -1,6 +1,6 @@
-import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { basename } from 'node:path';
+import { NONCE_RE, otaProof, sha256Hex } from './linkauth.js';
 
 /** ESP32 images start with 0xE9 and the ESP32-S3 chip id lives in the extended header. Reject obvious mistakes. */
 export function checkAppImage(buf: Buffer, name = 'image'): void {
@@ -12,7 +12,12 @@ export function checkAppImage(buf: Buffer, name = 'image'): void {
     throw new Error(`${name} looks like a MERGED image; OTA needs the app image (smart_deck.ino.bin, firmware/dist/parts/)`);
 }
 
-/** Upload an app image to the deck's OTA endpoint (http://<address>:7779/update). */
+/**
+ * Upload an app image to the deck's OTA endpoint (http://<address>:7779), PROTOCOL.md v4:
+ *  1. GET /challenge -> single-use nonce
+ *  2. POST /update with the nonce, the image's SHA-256 and HMAC(token, "ota:<nonce>:<sha256>").
+ * The token is never sent; a sniffed request can't be replayed and the image can't be swapped (the proof covers its hash).
+ */
 export async function otaUpdate(
   address: string,
   token: string,
@@ -24,11 +29,25 @@ export async function otaUpdate(
   checkAppImage(data, basename(binPath));
   const host = address.replace(/:\d+$/, '');
   if (!/^[A-Za-z0-9._-]+$/.test(host)) throw new Error(`bad address: ${address}`);
-  const sha = createHash('sha256').update(data).digest('hex').slice(0, 12);
-  log(`uploading ${basename(binPath)} (${data.length} bytes, sha256 ${sha}…) to ${host}:7779`);
-  const res = await fetchImpl(`http://${host}:7779/update`, {
+  const base = `http://${host}:7779`;
+  const sha = sha256Hex(data);
+  log(`uploading ${basename(binPath)} (${data.length} bytes, sha256 ${sha.slice(0, 12)}…) to ${host}:7779`);
+
+  const ch = await fetchImpl(`${base}/challenge`);
+  if (ch.status === 429 || ch.status === 401) throw new Error('deck refused the request (locked out after failed attempts? wait 30 s)');
+  if (!ch.ok) throw new Error(`OTA challenge failed: HTTP ${ch.status}`);
+  const nonce = (await ch.text()).trim();
+  if (!NONCE_RE.test(nonce)) throw new Error('deck sent a malformed OTA challenge');
+
+  const res = await fetchImpl(`${base}/update`, {
     method: 'POST',
-    headers: { 'X-SmartDeck-Token': token, 'Content-Type': 'application/octet-stream', 'Content-Length': String(data.length) },
+    headers: {
+      'X-SmartDeck-Nonce': nonce,
+      'X-SmartDeck-Sha256': sha,
+      'X-SmartDeck-Auth': otaProof(token, nonce, sha),
+      'Content-Type': 'application/octet-stream',
+      'Content-Length': String(data.length),
+    },
     body: data,
   });
   const text = (await res.text()).trim().slice(0, 200);

@@ -97,3 +97,17 @@ test('buttons with a label ask the firmware to draw it (stock firmware draws non
   assert.equal(toDeviceButton({ label: 'Mute', icon: 'm.jpg', action: { type: 'media', key: 'mute' } })!.showLabel, true);
   assert.equal('showLabel' in toDeviceButton({ action: { type: 'none' } })!, false);
 });
+
+test('blepair: action sends BLE_PAIR, validates seconds, device JSON is device-local', async () => {
+  const lines: string[] = [];
+  const ex = new ActionExecutor(async () => {}, () => {}, undefined, undefined, () => undefined, async () => {}, async (l) => void lines.push(l));
+  await ex.execute({ type: 'blepair' });
+  await ex.execute({ type: 'blepair', seconds: 30 });
+  assert.deepEqual(lines, ['BLE_PAIR:120', 'BLE_PAIR:30']);
+  await assert.rejects(ex.execute({ type: 'blepair', seconds: 0 }), /1-300/);
+  await assert.rejects(ex.execute({ type: 'blepair', seconds: 9999 }), /1-300/);
+  assert.deepEqual(toDeviceButton({ action: { type: 'blepair' } }), { type: 'blepair' });
+  const b = defaultConfig();
+  b.pages[0].buttons[0] = { label: 'x', action: { type: 'blepair', seconds: 301 } };
+  assert.throws(() => validate(b), /blepair seconds/);
+});

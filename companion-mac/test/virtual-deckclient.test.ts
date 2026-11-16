@@ -1,4 +1,5 @@
 // The real Mac-side Deck class driving the virtual deck over TCP: proves the emulator is a drop-in for hardware.
+import { handshake } from './helpers.js';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
@@ -33,9 +34,7 @@ class SocketTransport extends EventEmitter implements Transport {
 
 async function link(port: number, token: string) {
   const sock = createConnection({ port, host: '127.0.0.1' });
-  const first = new Promise<string>((res) => sock.once('data', (d) => res(d.toString().trim())));
-  sock.write(`AUTH:${token}\n`);
-  assert.equal(await first, 'AUTH_OK');
+  await handshake(sock, token);
   return new SocketTransport(sock);
 }
 

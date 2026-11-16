@@ -74,10 +74,17 @@ async function server(emulator: Record<string, unknown> = {}) {
   const v = await startVirtualDeck({ port: 0, uiPort: 0, token: 'good-token-1', dataDir: tmp(), emulator: { rebootDelayMs: 20, bootMs: 150, ...emulator } });
   return v;
 }
+import { clientProof, deckProof } from '../src/linkauth.js';
+/** Wait for CHALLENGE and answer it with `token` (plus optional pipelined data). Returns the nonce. */
+async function answer(c: Client, token: string, extra = '') {
+  const nonce = (await c.wait((l) => l.startsWith('CHALLENGE:'))).slice('CHALLENGE:'.length);
+  c.send(`AUTH:${clientProof(token, nonce)}\n${extra}`);
+  return nonce;
+}
 async function authed(port: number, token = 'good-token-1') {
   const c = await Client.connect(port);
-  c.send(`AUTH:${token}\n`);
-  await c.expect('AUTH_OK');
+  const nonce = await answer(c, token);
+  assert.equal((await c.wait((l) => l.startsWith('AUTH_OK:'))).slice(8), deckProof(token, nonce), 'deck proves it knows the token');
   return c;
 }
 
@@ -94,9 +101,10 @@ test('AUTH: good token -> AUTH_OK then the normal protocol works', async () => {
 test('AUTH: bad token / missing AUTH prefix -> AUTH_FAIL and the socket closes', async () => {
   const v = await server();
   try {
-    for (const first of ['AUTH:wrong-token\n', 'PING_DECK\n', 'AUTH:\n']) {
+    for (const how of ['wrong-token', 'no-auth', 'empty']) {
       const c = await Client.connect(v.tcpPort);
-      c.send(first);
+      if (how === 'wrong-token') await answer(c, 'wrong-token');
+      else { await c.wait((l) => l.startsWith('CHALLENGE:')); c.send(how === 'no-auth' ? 'PING_DECK\n' : 'AUTH:\n'); }
       await c.expect('AUTH_FAIL');
       assert.ok(await c.untilClosed());
     }
@@ -106,10 +114,9 @@ test('AUTH: bad token / missing AUTH prefix -> AUTH_FAIL and the socket closes',
 test('AUTH: 5 failures lock the link out, even for the right token', async () => {
   const v = await server();
   try {
-    for (let i = 0; i < 5; i++) { const c = await Client.connect(v.tcpPort); c.send('AUTH:nope\n'); await c.expect('AUTH_FAIL'); }
+    for (let i = 0; i < 5; i++) { const c = await Client.connect(v.tcpPort); await answer(c, 'nope'); await c.expect('AUTH_FAIL'); }
     const c = await Client.connect(v.tcpPort);
-    c.send('AUTH:good-token-1\n');
-    await c.expect('AUTH_FAIL');
+    await c.expect('AUTH_FAIL'); // locked out: refused before any challenge
   } finally { await v.close(); }
 });
 
@@ -128,8 +135,8 @@ test('commands pipelined right behind AUTH in the same packet are processed', as
   const v = await server();
   try {
     const c = await Client.connect(v.tcpPort);
-    c.send('AUTH:good-token-1\nPING_DECK\n');
-    await c.expect('AUTH_OK');
+    await answer(c, 'good-token-1', 'PING_DECK\n');
+    await c.wait((l) => l.startsWith('AUTH_OK:'));
     await c.expect('PONG_DECK:Smart Deck');
   } finally { await v.close(); }
 });
@@ -426,7 +433,7 @@ test('SET_NET token changes what the TCP link accepts', async () => {
   try {
     const c = await authed(v.tcpPort);
     c.send('SET_NET:{"token":"brand-new-token"}\n'); await c.expect('NET_SET:ok');
-    const old = await Client.connect(v.tcpPort); old.send('AUTH:good-token-1\n'); await old.expect('AUTH_FAIL');
+    const old = await Client.connect(v.tcpPort); await answer(old, 'good-token-1'); await old.expect('AUTH_FAIL');
     const fresh = await authed(v.tcpPort, 'brand-new-token');
     fresh.send('PING_DECK\n'); await fresh.expect('PONG_DECK:Smart Deck');
   } finally { await v.close(); }
@@ -481,4 +488,34 @@ test('runaway lines without a newline are dropped, not buffered forever', () => 
   l.deck.feed(Buffer.alloc(20000, 65));
   l.send('PING_DECK');
   assert.deepEqual(l.take(), ['PONG_DECK:Smart Deck']);
+});
+
+
+test('AUTH: the token never crosses the link, a proof cannot be replayed on another connection, and the nonce is fresh', async () => {
+  const v = await server();
+  try {
+    const a = await Client.connect(v.tcpPort);
+    const na = (await a.wait((l) => l.startsWith('CHALLENGE:'))).slice(10);
+    const b = await Client.connect(v.tcpPort);
+    const nb = (await b.wait((l) => l.startsWith('CHALLENGE:'))).slice(10);
+    assert.match(na, /^[0-9a-f]{32}$/); assert.notEqual(na, nb);
+    // a sniffed proof for connection A is useless on connection B
+    b.send(`AUTH:${clientProof('good-token-1', na)}\n`);
+    await b.expect('AUTH_FAIL');
+    // and the real proof still works on A
+    a.send(`AUTH:${clientProof('good-token-1', na)}\n`);
+    assert.equal((await a.wait((l) => l.startsWith('AUTH_OK:'))).slice(8), deckProof('good-token-1', na));
+    assert.ok(![...a.lines, ...b.lines].some((l) => l.includes('good-token-1')), 'the token itself must never be sent');
+  } finally { await v.close(); }
+});
+
+test('AUTH: pending connections are capped; a new one evicts the oldest (no starvation by idle sockets)', async () => {
+  const v = await server();
+  try {
+    const idle: Client[] = [];
+    for (let i = 0; i < 4; i++) { const c = await Client.connect(v.tcpPort); await c.wait((l) => l.startsWith('CHALLENGE:')); idle.push(c); }
+    assert.ok(await idle[0].untilClosed(), 'the oldest pending connection was evicted');
+    const real = await authed(v.tcpPort); // the real host still gets in
+    real.send('PING_DECK\n'); await real.expect('PONG_DECK:Smart Deck');
+  } finally { await v.close(); }
 });

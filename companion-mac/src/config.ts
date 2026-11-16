@@ -199,6 +199,7 @@ export function validate(c: Config): Config {
       for (const k of ['on', 'off'] as const) if (h[k] !== undefined && !/^[0-9a-fA-F]{6}$/.test(h[k]!)) throw new Error(`page ${pi + 1} button ${bi + 1}: haState.${k} must be 6 hex digits`);
       if (h.interval !== undefined && !(h.interval >= 5)) throw new Error(`page ${pi + 1} button ${bi + 1}: haState.interval must be >= 5 seconds`);
     }
+    if (b?.action?.type === 'blepair' && b.action.seconds !== undefined && !(Number.isInteger(b.action.seconds) && b.action.seconds >= 1 && b.action.seconds <= 300)) throw new Error(`page ${pi + 1} button ${bi + 1}: blepair seconds must be 1-300`);
     if (b?.action?.type === 'blehost' && ![1, 2, 3, 'next'].includes(b.action.slot as any)) throw new Error(`page ${pi + 1} button ${bi + 1}: blehost slot must be 1, 2, 3 or next`);
   }));
   if (c.triggers !== undefined) validateTriggers(c.triggers);
@@ -245,6 +246,7 @@ export function toDeviceButton(b: Button | null): Record<string, unknown> | null
     case 'http': out.http = { url: a.url, ...(a.method ? { method: a.method } : {}), ...(a.body ? { body: a.body } : {}) }; break;
     case 'media': out.media = a.key; break;
     case 'blehost': out.slot = a.slot; break;
+    case 'blepair': break; // device-local: no extra fields
     case 'ha': out.ha = { service: a.service, ...(a.entity ? { entity: a.entity } : {}), ...(a.data ? { data: a.data } : {}) }; break;
   }
   return out;

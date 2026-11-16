@@ -1,3 +1,4 @@
+import { handshake } from './helpers.js';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, writeFileSync } from 'node:fs';
@@ -101,7 +102,7 @@ test('UI hooks drive the deck: touch -> BTN to the TCP host, swipe changes page,
     const sock = createConnection({ port: v.tcpPort, host: '127.0.0.1' });
     const lines: string[] = [];
     sock.on('data', (d) => lines.push(...d.toString().split('\n').map((l) => l.trim()).filter(Boolean)));
-    sock.write('AUTH:ui-test-token\nHB\n');
+    await handshake(sock, 'ui-test-token', 'HB\n');
     await new Promise((r) => setTimeout(r, 100));
     const post = (path: string, body: unknown) => req(v.uiUrl + path.slice(1), { method: 'POST', headers: { 'X-SmartDeck-Token': v.uiToken }, body });
     await post('/api/touch', { index: 0 });
@@ -138,7 +139,7 @@ test('ALERT end-to-end: host sends ALERT over TCP, UI acknowledges via /api/ack,
     const sock = createConnection({ port: v.tcpPort, host: '127.0.0.1' });
     const lines: string[] = [];
     sock.on('data', (d) => lines.push(...d.toString().split('\n').map((l) => l.trim()).filter(Boolean)));
-    sock.write('AUTH:ui-test-token\nALERT:red:30:PRINT FAILED\n');
+    await handshake(sock, 'ui-test-token', 'ALERT:red:30:PRINT FAILED\n');
     await new Promise((r) => setTimeout(r, 100));
     let s = JSON.parse((await req(v.uiUrl + 'api/state')).body);
     assert.equal(s.alert.kind, 'red'); assert.equal(s.alert.text, 'PRINT FAILED');

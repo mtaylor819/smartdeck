@@ -6,7 +6,7 @@ import { cmd, parseLine } from '../src/protocol.js';
 import { defaultConfig, toDeviceButton, validate } from '../src/config.js';
 import { Deck } from '../src/deck.js';
 import { TcpTransport } from '../src/transport.js';
-import { FakeTransport, tick } from './helpers.js';
+import { FakeTransport, serveHandshake, tick } from './helpers.js';
 
 test('parses new deck events', () => {
   assert.deepEqual(parseLine('BTN_HOLD:1:4'), { type: 'hold', page: 1, index: 4 });
@@ -86,20 +86,13 @@ test('config validation: device block, schedule, sleep screens', () => {
   assert.throws(() => validate({ ...c, sleepScreen: 'nope' as any }), /sleepScreen/);
 });
 
-/** Tiny fake deck: AUTH then echoes lines upper-cased. */
+/** Tiny fake deck: v4 handshake, then echoes lines. */
 function fakeDeck(token: string) {
   const server = net.createServer((s) => {
-    let buf = ''; let authed = false;
-    s.on('data', (d) => {
-      buf += d.toString();
-      let i: number;
-      while ((i = buf.indexOf('\n')) >= 0) {
-        const line = buf.slice(0, i); buf = buf.slice(i + 1);
-        if (!authed) {
-          if (line === `AUTH:${token}`) { authed = true; s.write('AUTH_OK\nPONG_DECK:Fake\n'); } else { s.write('AUTH_FAIL\n'); s.end(); }
-        } else s.write(`ECHO:${line}\n`);
-      }
-    });
+    let buf = '', authed = false;
+    const drain = () => { let i: number; while ((i = buf.indexOf('\n')) >= 0) { const line = buf.slice(0, i); buf = buf.slice(i + 1); s.write(`ECHO:${line}\n`); } };
+    const hs = serveHandshake(s, token, (rest) => { authed = true; s.write('PONG_DECK:Fake\n'); buf = rest; drain(); });
+    s.on('data', (d) => { if (!authed) { hs(d.toString()); return; } buf += d.toString(); drain(); });
   });
   return new Promise<{ port: number; close(): void }>((r) => server.listen(0, '127.0.0.1', () => r({ port: (server.address() as net.AddressInfo).port, close: () => server.close() })));
 }
@@ -123,4 +116,28 @@ test('TcpTransport: wrong token and refused connection reject', async () => {
     await assert.rejects(TcpTransport.connect(`127.0.0.1:${f.port}`, 'wrong-token'), /rejected the token/);
   } finally { f.close(); }
   await assert.rejects(TcpTransport.connect('127.0.0.1:1', 'x', 500));
+});
+
+test('TcpTransport: an impostor that answers AUTH_OK with a wrong proof is rejected (the deck must prove the token too)', async () => {
+  const server = net.createServer((s) => { s.write('CHALLENGE:00112233445566778899aabbccddeeff\n'); s.once('data', () => s.write('AUTH_OK:' + '0'.repeat(64) + '\n')); });
+  await new Promise<void>((r) => server.listen(0, '127.0.0.1', () => r()));
+  try {
+    await assert.rejects(TcpTransport.connect(`127.0.0.1:${(server.address() as net.AddressInfo).port}`, 'right-token-1'), /impostor|could not prove/);
+  } finally { server.close(); }
+});
+
+test('TcpTransport: the token is never sent, only an HMAC of the nonce; malformed challenges are refused', async () => {
+  const seen: string[] = [];
+  const server = net.createServer((s) => { s.write('CHALLENGE:00112233445566778899aabbccddeeff\n'); s.on('data', (d) => seen.push(d.toString())); });
+  await new Promise<void>((r) => server.listen(0, '127.0.0.1', () => r()));
+  const port = (server.address() as net.AddressInfo).port;
+  try {
+    await assert.rejects(TcpTransport.connect(`127.0.0.1:${port}`, 'secret-token-xyz', 300)); // no AUTH_OK => times out
+    const line = seen.join('').trim();
+    assert.match(line, /^AUTH:[0-9a-f]{64}$/);
+    assert.ok(!line.includes('secret-token-xyz'));
+  } finally { server.close(); }
+  const bad = net.createServer((s) => s.write('CHALLENGE:short\n'));
+  await new Promise<void>((r) => bad.listen(0, '127.0.0.1', () => r()));
+  try { await assert.rejects(TcpTransport.connect(`127.0.0.1:${(bad.address() as net.AddressInfo).port}`, 'secret-token-xyz'), /unexpected reply/); } finally { bad.close(); }
 });

@@ -62,9 +62,12 @@ Flash `firmware/dist/smartdeck-jc8048w550-merged.bin` once over USB, then:
 1. **Provision over USB** (Settings -> *Deck connectivity*): WiFi SSID + password, a link/OTA token (*Generate*), optional
    Bluetooth and Home Assistant details for the deck itself, then *Push to deck*. Secrets travel **only over USB**.
 2. **WiFi link:** set *Deck address* (`smartdeck.local`). The Mac app uses USB when plugged in and falls back to WiFi otherwise
-   (plain TCP on your LAN, protected by the token).
+   (TCP on your LAN. The token is **never sent**: the deck and the Mac prove they both know it with an HMAC challenge-response, so a
+   sniffer or an impostor device can't capture it. Traffic after that is not encrypted, which is fine on a home LAN.)
 3. **Standalone:** with no Mac connected the deck runs buttons itself: `key`/`text`/`media` over a **Bluetooth keyboard** to any
    machine, `ha`/`http` over WiFi straight to Home Assistant. *Run on the deck* = auto / always / never.
+   **Bluetooth pairing is deliberately closed** except for a short window: it opens for 2 minutes the first time you enable Bluetooth,
+   and whenever you press a *Bluetooth pairing mode* button (or run `BLE_PAIR`). Only already-paired machines can connect otherwise.
 4. **OTA updates:** `smartdeck-mac ota ../firmware/dist/smartdeck-jc8048w550-app.bin` (app image only). No automatic rollback on this
    ESP32 core: a bad image that boot-loops needs a USB reflash with the merged image.
 5. **Red alert:** `smartdeck-mac alert red 30 "Build failed"` (also a button action, `POST /api/alert`, or the test buttons in Settings).

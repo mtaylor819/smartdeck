@@ -49,7 +49,8 @@ connected with an IP. Then set *Deck address* (`smartdeck.local`) and unplug USB
   If an OTA ever boot-loops, reflash the merged image over USB.
 
 ## 5. Standalone + Bluetooth
-Enable *Bluetooth keyboard*, push settings, pair "SmartDeck" in macOS Bluetooth settings. Stop the Mac app (so no host is present)
+Enable *Bluetooth keyboard*, push settings, then pair "SmartDeck" in macOS Bluetooth settings **within 2 minutes** (the pairing window
+opens automatically the first time; later, add a *Bluetooth pairing mode* button to reopen it). Strangers can't pair outside the window. Stop the Mac app (so no host is present)
 and wait 15 s: `key`/`text`/`media` buttons should now type on the paired machine; `ha` buttons call Home Assistant directly.
 - Bluetooth host slots: add a *Bluetooth host* button, switch slots, pair a second machine.
 - Typed text assumes a **US layout** on the receiving machine.

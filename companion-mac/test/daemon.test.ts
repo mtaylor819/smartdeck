@@ -8,23 +8,24 @@ import { defaultConfig } from '../src/config.js';
 import { Daemon } from '../src/daemon.js';
 import { scheduledBrightness } from '../src/schedule.js';
 import { checkAppImage, otaUpdate } from '../src/ota.js';
+import { serveHandshake } from './helpers.js';
 
 /** Fake WiFi deck. newFirmware=false mimics the stock firmware: ignores GET_NET/HB. */
 function fakeWifiDeck(token: string, newFirmware: boolean) {
   const received: string[] = [];
   const server = net.createServer((s) => {
     let buf = '', authed = false;
-    s.on('data', (d) => {
-      buf += d.toString();
+    const drain = () => {
       let i: number;
       while ((i = buf.indexOf('\n')) >= 0) {
         const line = buf.slice(0, i); buf = buf.slice(i + 1);
-        if (!authed) { if (line === `AUTH:${token}`) { authed = true; s.write('AUTH_OK\n'); } else { s.write('AUTH_FAIL\n'); s.end(); } continue; }
         received.push(line);
         if (line === 'PING_DECK') s.write('PONG_DECK:Fake Deck\n');
         if (line === 'GET_NET' && newFirmware) s.write('NET_STATUS:{"wifi":"connected","ble":"advertising"}\n');
       }
-    });
+    };
+    const hs = serveHandshake(s, token, (rest) => { authed = true; buf = rest; drain(); });
+    s.on('data', (d) => { if (!authed) { hs(d.toString()); return; } buf += d.toString(); drain(); });
   });
   return new Promise<{ port: number; received: string[]; close(): void }>((r) =>
     server.listen(0, '127.0.0.1', () => r({ port: (server.address() as net.AddressInfo).port, received, close: () => { server.close(); } })));
@@ -123,15 +124,30 @@ test('OTA: image sanity checks and upload request shape', async () => {
 
   const dir = mkdtempSync(join(tmpdir(), 'ota-'));
   const f = join(dir, 'app.bin'); writeFileSync(f, good);
+  const NONCE = '00112233445566778899aabbccddeeff';
   const seen: any[] = [];
-  const fetchOk = (async (u: string, o: any) => (seen.push([u, o]), { ok: true, status: 200, text: async () => 'OK' })) as any;
-  await otaUpdate('smartdeck.local', 'tok', f, fetchOk);
-  assert.equal(seen[0][0], 'http://smartdeck.local:7779/update');
-  assert.equal(seen[0][1].headers['X-SmartDeck-Token'], 'tok');
-  assert.equal(seen[0][1].body.length, 100_000);
-  const fetch401 = (async () => ({ ok: false, status: 401, text: async () => 'no' })) as any;
-  await assert.rejects(otaUpdate('1.2.3.4:7778', 'bad', f, fetch401), /rejected the token/);
-  await assert.rejects(otaUpdate('evil.com/x?', 'tok', f, fetchOk), /bad address/);
+  const fetchOk = (async (u: string, o: any) => {
+    seen.push([u, o]);
+    if (u.endsWith('/challenge')) return { ok: true, status: 200, text: async () => NONCE + '\n' };
+    return { ok: true, status: 200, text: async () => 'OK' };
+  }) as any;
+  await otaUpdate('smartdeck.local', 'tok-secret-1', f, fetchOk);
+  assert.equal(seen[0][0], 'http://smartdeck.local:7779/challenge');
+  assert.equal(seen[1][0], 'http://smartdeck.local:7779/update');
+  const h = seen[1][1].headers;
+  const { otaProof, sha256Hex } = await import('../src/linkauth.js');
+  assert.equal(h['X-SmartDeck-Nonce'], NONCE);
+  assert.equal(h['X-SmartDeck-Sha256'], sha256Hex(good));
+  assert.equal(h['X-SmartDeck-Auth'], otaProof('tok-secret-1', NONCE, sha256Hex(good)));
+  assert.ok(!JSON.stringify(seen).includes('tok-secret-1'), 'the token must never be sent');
+  assert.equal(seen[1][1].body.length, 100_000);
+  const fetch401 = (async (u: string) => u.endsWith('/challenge') ? { ok: true, status: 200, text: async () => NONCE } : { ok: false, status: 401, text: async () => 'no' }) as any;
+  await assert.rejects(otaUpdate('1.2.3.4:7778', 'bad-token-1', f, fetch401), /rejected the token/);
+  const fetchBadNonce = (async () => ({ ok: true, status: 200, text: async () => 'not-a-nonce' })) as any;
+  await assert.rejects(otaUpdate('1.2.3.4', 'tok-secret-1', f, fetchBadNonce), /malformed OTA challenge/);
+  const fetchLocked = (async () => ({ ok: false, status: 429, text: async () => '' })) as any;
+  await assert.rejects(otaUpdate('1.2.3.4', 'tok-secret-1', f, fetchLocked), /locked out/);
+  await assert.rejects(otaUpdate('evil.com/x?', 'tok-secret-1', f, fetchOk), /bad address/);
 });
 
 import { Keychain } from '../src/secrets.js';

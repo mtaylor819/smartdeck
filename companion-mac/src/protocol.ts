@@ -153,6 +153,7 @@ export const cmd = {
   setBtnLive: (page: number, index: number, o: { label?: string; labelColor?: string; btnColor?: string; labelSize?: number; icon?: string }) =>
     `SET_BTN_LIVE:${page}:${index}:${JSON.stringify(o)}`,
   bleHost: (slot: 1 | 2 | 3 | 'next') => `BLE_HOST:${slot}`,
+  blePair: (seconds = 120) => `BLE_PAIR:${clamp(Math.round(seconds), 1, 300)}`,
   getNet: () => 'GET_NET',
   /** Provisioning blob. Secrets inside: only send over USB (or an authenticated link). */
   setNet: (o: Record<string, unknown>) => `SET_NET:${JSON.stringify(o)}`,

@@ -1,5 +1,6 @@
 import { EventEmitter } from 'node:events';
 import net from 'node:net';
+import { clientProof, ctEqualHex, deckProof, NONCE_RE } from './linkauth.js';
 import { SerialPort, ReadlineParser } from 'serialport';
 
 /** What the deck controller needs from a connection. Real = serial; tests use a fake. */
@@ -84,7 +85,7 @@ export async function findDeck(
   return null;
 }
 
-/** Line-based TCP link to a deck over WiFi (or to the virtual deck). First line sent is AUTH:<token>. */
+/** Line-based TCP link to a deck over WiFi (or to the virtual deck). Mutual HMAC challenge-response; the token is never sent. */
 export class TcpTransport extends EventEmitter implements Transport {
   private buf = '';
   private constructor(private sock: net.Socket) {
@@ -105,7 +106,10 @@ export class TcpTransport extends EventEmitter implements Transport {
     sock.on('error', (e) => { if (this.listenerCount('error')) this.emit('error', e); });
   }
 
-  /** Connect and authenticate. Rejects on timeout, refusal or AUTH_FAIL. */
+  /**
+   * Connect and authenticate (deck sends CHALLENGE:<nonce>; we answer AUTH:<hmac>; the deck must answer AUTH_OK:<hmac> which we verify).
+   * Rejects on timeout, refusal, AUTH_FAIL, a malformed challenge, or a deck that cannot prove it knows the token.
+   */
   static connect(address: string, token: string, timeoutMs = 4000): Promise<TcpTransport> {
     const m = /^(.+?)(?::(\d{1,5}))?$/.exec(address);
     if (!m) return Promise.reject(new Error(`bad address: ${address}`));
@@ -119,23 +123,38 @@ export class TcpTransport extends EventEmitter implements Transport {
       sock.once('connect', () => {
         sock.setEncoding('utf8');
         let acc = '';
+        let nonce: string | undefined;
         const onData = (chunk: string) => {
           acc += chunk;
-          const nl = acc.indexOf('\n');
-          if (nl < 0) return;
-          sock.off('data', onData);
-          clearTimeout(timer);
-          const reply = acc.slice(0, nl).trim();
-          if (reply !== 'AUTH_OK') return fail(new Error(reply === 'AUTH_FAIL' ? 'deck rejected the token' : `unexpected reply: ${reply.slice(0, 40)}`));
-          sock.off('error', fail);
-          const t = new TcpTransport(sock);
-          // anything after AUTH_OK in the same chunk belongs to the stream
-          const rest = acc.slice(nl + 1);
-          if (rest) setImmediate(() => sock.emit('data', rest));
-          resolve(t);
+          if (acc.length > 4096) return fail(new Error('handshake too long'));
+          for (;;) {
+            const nl = acc.indexOf('\n');
+            if (nl < 0) return;
+            const line = acc.slice(0, nl).replace(/\r$/, '').trim();
+            acc = acc.slice(nl + 1);
+            if (!nonce) {
+              if (line === 'AUTH_FAIL') return fail(new Error('deck rejected the token'));
+              const c = /^CHALLENGE:(.+)$/.exec(line);
+              if (!c || !NONCE_RE.test(c[1])) return fail(new Error(`unexpected reply from deck: ${line.slice(0, 40)}`));
+              nonce = c[1];
+              sock.write(`AUTH:${clientProof(token, nonce)}\n`);
+              continue;
+            }
+            if (line === 'AUTH_FAIL') return fail(new Error('deck rejected the token'));
+            const ok = /^AUTH_OK:([0-9a-f]{64})$/.exec(line);
+            if (!ok) return fail(new Error(`unexpected reply from deck: ${line.slice(0, 40)}`));
+            // the deck must prove it knows the token too: otherwise it is an impostor
+            if (!ctEqualHex(ok[1], deckProof(token, nonce))) return fail(new Error('the device at that address could not prove it knows the token (impostor?)'));
+            clearTimeout(timer);
+            sock.off('data', onData);
+            sock.off('error', fail);
+            const t = new TcpTransport(sock);
+            // anything after AUTH_OK in the same chunk belongs to the stream
+            if (acc) { const rest = acc; setImmediate(() => sock.emit('data', rest)); }
+            return resolve(t);
+          }
         };
         sock.on('data', onData);
-        sock.write(`AUTH:${token}\n`);
       });
     });
   }
