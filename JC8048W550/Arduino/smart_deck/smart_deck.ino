@@ -250,10 +250,18 @@ bool host_link_active();                                              // feature
 bool net_standalone_always();                                         // net_wifi.h ([net] "standalone":"always" runs on-device even with a host)
 bool net_tcp_take_line(String& out);                                   // net_wifi.h ([net] next command line from the WiFi host link)
 bool standalone_button(int page, int idx, bool hasState, bool state);  // features.h
+bool ble_local_button(JsonObject cfg);                                  // ble_hid.h (BLE host-slot switch button)
 
 // *** NEW: Send Command to PC/Dongle Function (State Supported) ***
 void send_pc_command(int page, int index) {
   char command[64];
+
+  // [ble-host hook] "blehost" buttons are DEVICE-LOCAL (like "goto"): they switch the BLE host slot on the deck itself and are
+  // NEVER forwarded to the host app, even when one is connected. ble_local_button() returns false for every other type.
+  {
+    JsonObject lc = doc["pages"][page]["buttons"][index];
+    if (!lc.isNull() && ble_local_button(lc)) return;
+  }
 
   // No host app connected? Try to run the button on the deck itself (BLE keyboard / WiFi Home Assistant).
   if (!host_link_active() || net_standalone_always()) {
@@ -3220,7 +3228,7 @@ void loop() {
               draw_single_button(last_touched_button_index);
               Serial.printf("TIMER_UPDATE:%d:%d:0:%d\n", current_page, last_touched_button_index, timer.lastSeconds);
             }
-          } else if (released_btn.action == "key" || released_btn.action == "text" || released_btn.action == "app" || released_btn.action == "script" || released_btn.action == "website" || released_btn.action == "media" || released_btn.action == "mouse" || released_btn.action == "sound" || released_btn.action == "multi") {
+          } else if (released_btn.action == "key" || released_btn.action == "text" || released_btn.action == "app" || released_btn.action == "script" || released_btn.action == "website" || released_btn.action == "media" || released_btn.action == "mouse" || released_btn.action == "sound" || released_btn.action == "multi" || released_btn.action == "blehost" /* [ble-host hook] routed to send_pc_command, which runs it locally */) {
             send_pc_command(current_page, last_touched_button_index);
           } else if (released_btn.action == "toggle") {
             current_toggles[last_touched_button_index].state = !current_toggles[last_touched_button_index].state;

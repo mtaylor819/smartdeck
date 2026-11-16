@@ -9,6 +9,8 @@
 //  * Just-Works pairing with bonding (bonds persisted by NimBLE in NVS), advertises as a keyboard (appearance 0x03C1).
 //  * ble_button(): runs type key / text / media buttons over BLE, only while a host is connected. Typing is queued and
 //    pumped from ble_loop() (never blocks).
+//  * Host slots (v3, fork "fw-blehost"): 3 slots, each its own BLE identity so every machine bonds separately; BLE_HOST:<n|next>
+//    switches (drops the current host, advertises as the new slot); type "blehost" buttons do the same on the deck itself.
 //  * Radio note: WiFi and BLE share the one 2.4 GHz radio; the ESP32 coexistence layer time-slices them. Expect slightly
 //    higher HID latency while WiFi is busy (e.g. during an OTA upload). Both are fully supported together by the core.
 #ifndef BLE_HID_H
@@ -16,13 +18,26 @@
 
 #include <NimBLEDevice.h>
 #include <NimBLEHIDDevice.h>
+#include <esp_system.h>      // esp_efuse_mac_get_default (stable per-chip seed for the slot identities)
 #include "ble_keys.h"
+#include "ble_slots.h"
 
 // ---- Cross-module API used by net_wifi.h (CONTRACT, keep these signatures) -------------------------------------
 enum BleState : uint8_t { BLE_ST_OFF = 0, BLE_ST_ADV = 1, BLE_ST_CONN = 2 };
 
 static volatile BleState ble_st = BLE_ST_OFF;
 static char ble_peer[20] = "";
+
+// ---- Host slots (v3): one deck, up to 3 machines. Each slot has its own BLE identity so each host bonds separately. ----
+// Slot 1 keeps the chip's PUBLIC address (so bonds made with the pre-slot firmware keep working); slots 2/3 use a stable
+// static-random address derived from the chip MAC (ble_slot_addr). Only one host is connected at a time.
+static uint8_t ble_slot = 1;                                         // current slot 1..3 (persisted "ble"/"cur")
+static char ble_slot_names[BLE_SLOT_COUNT][BLE_SLOT_NAME_MAX + 1] = { "Host 1", "Host 2", "Host 3" };   // persisted s1..s3
+static uint8_t ble_slot_peer[BLE_SLOT_COUNT][7];                     // last bonded peer per slot: [0]=addr type, [1..6]=addr (0 type+0 addr = none)
+static volatile bool ble_bond_pending = false;                       // set by the NimBLE task when pairing finished; main loop persists
+static uint8_t ble_bond_peer_tmp[7];
+static uint8_t ble_clear_slot_mask = 0;                              // bit n-1: delete that slot's recorded bond once the stack is up
+static unsigned long ble_toast_until = 0;                            // millis() when the on-screen "BT: <slot>" toast should be removed
 
 const char* ble_state_str() {
   switch (ble_st) {
@@ -32,16 +47,20 @@ const char* ble_state_str() {
   }
 }
 String ble_peer_str() { return String(ble_peer); }
-// v3 contract stubs (fork "blehost" replaces these with the real slot logic; keep the signatures):
-int ble_slot_num() { return 1; }
-String ble_slots_json() { return String("[]"); }
+// v3 slot API used by net_wifi.h (CONTRACT, keep these signatures)
+int ble_slot_num() { return ble_slot; }
+String ble_slots_json() {                       // always 3 entries (defaults "Host 1".."Host 3" until named via SET_BLE slots)
+  char buf[96];
+  if (!ble_slots_to_json(ble_slot_names, buf, sizeof(buf))) return String("[]");
+  return String(buf);
+}
 
 // ---- State -------------------------------------------------------------------------------------------------------
 static bool ble_enabled = false;                 // persisted ("ble"/"en"); default off until SET_BLE
 static char ble_name[25] = "SmartDeck";          // persisted ("ble"/"name"), 1..24 printable ASCII
 static bool ble_running = false;                 // NimBLE stack initialised
 static volatile bool ble_status_dirty = false;   // set from NimBLE callbacks; main loop emits net_status_changed()
-static bool ble_clear_bonds_pending = false;     // SET_BLE clear_bonds while stack was down
+static bool ble_clear_bonds_pending = false;     // SET_BLE clear_bonds:true while stack was down (all slots)
 static unsigned long ble_last_adv_check = 0;
 
 static NimBLEServer* ble_server = nullptr;
@@ -106,6 +125,16 @@ static void ble_load() {
   if (!p.begin("ble", false)) return;
   ble_enabled = p.getBool("en", false);
   String n = p.getString("name", "SmartDeck");
+  uint8_t cur = p.getUChar("cur", 1);
+  ble_slot = (cur >= 1 && cur <= BLE_SLOT_COUNT) ? cur : 1;
+  for (int i = 0; i < BLE_SLOT_COUNT; i++) {
+    char k[4] = { 's', (char)('1' + i), 0, 0 };
+    String sn = p.getString(k, "");
+    if (ble_slot_name_valid(sn.c_str())) { strncpy(ble_slot_names[i], sn.c_str(), BLE_SLOT_NAME_MAX); ble_slot_names[i][BLE_SLOT_NAME_MAX] = 0; }
+    k[0] = 'p';
+    memset(ble_slot_peer[i], 0, 7);
+    if (p.getBytesLength(k) == 7) p.getBytes(k, ble_slot_peer[i], 7);
+  }
   p.end();
   if (ble_name_valid(n.c_str())) strncpy(ble_name, n.c_str(), sizeof(ble_name) - 1);
   ble_name[sizeof(ble_name) - 1] = 0;
@@ -115,6 +144,19 @@ static void ble_save() {
   if (!p.begin("ble", false)) return;
   p.putBool("en", ble_enabled);
   p.putString("name", ble_name);
+  p.putUChar("cur", ble_slot);
+  for (int i = 0; i < BLE_SLOT_COUNT; i++) {
+    char k[4] = { 's', (char)('1' + i), 0, 0 };
+    p.putString(k, ble_slot_names[i]);
+  }
+  p.end();
+}
+// Remember which peer is bonded to a slot, so "clear this slot's bond" can find it later.
+static void ble_save_peer(int slot) {
+  Preferences p;
+  if (!p.begin("ble", false)) return;
+  char k[4] = { 'p', (char)('0' + slot), 0, 0 };
+  p.putBytes(k, ble_slot_peer[slot - 1], 7);
   p.end();
 }
 
@@ -132,8 +174,53 @@ class BleServerCb : public NimBLEServerCallbacks {
     ble_st = ble_running ? BLE_ST_ADV : BLE_ST_OFF;   // NimBLEServer re-advertises on disconnect by default
     ble_status_dirty = true;
   }
+  void onAuthenticationComplete(ble_gap_conn_desc* desc) override {
+    // Pairing/encryption finished. If the link is bonded, remember the peer's IDENTITY address for the current slot
+    // (persisted from the main loop, not here: this runs on the NimBLE task).
+    if (desc && desc->sec_state.encrypted && desc->sec_state.bonded) {
+      ble_bond_peer_tmp[0] = desc->peer_id_addr.type;
+      memcpy(ble_bond_peer_tmp + 1, desc->peer_id_addr.val, 6);
+      ble_bond_pending = true;
+    }
+  }
 };
 static BleServerCb ble_server_cb;
+
+// ---- Identity per slot ------------------------------------------------------------------------------------------
+// NimBLE-Arduino 1.4.3 has no setOwnAddr(); on the ESP32 port the host does NOT auto-pick an address at sync, so after init()
+// (which blocks until the host is synced) we can set a static-random identity with the NimBLE host API ble_hs_id_set_rnd() and
+// then select it for advertising with setOwnAddrType(). Must run before the first advertising start.
+static void ble_apply_identity() {
+  if (ble_slot == 1) { NimBLEDevice::setOwnAddrType(BLE_OWN_ADDR_PUBLIC); return; }       // slot 1 = legacy public identity
+  uint8_t mac[6] = {0}, addr[6];
+  esp_efuse_mac_get_default(mac);
+  ble_slot_addr(mac, ble_slot, addr);
+  int rc = ble_hs_id_set_rnd(addr);
+  if (rc != 0) {                                                                          // should not happen; degrade, don't die
+    Serial.printf("BLE: could not set slot %d identity (rc=%d); using the public address (slots will share bonds)\n", ble_slot, rc);
+    NimBLEDevice::setOwnAddrType(BLE_OWN_ADDR_PUBLIC);
+    return;
+  }
+  NimBLEDevice::setOwnAddrType(BLE_OWN_ADDR_RANDOM);
+}
+
+static bool ble_peer_recorded(int slot) {
+  const uint8_t* r = ble_slot_peer[slot - 1];
+  for (int i = 0; i < 7; i++) if (r[i]) return true;
+  return false;
+}
+
+// Delete the bond recorded for `slot` (stack must be running). Returns true if a bond was removed.
+static bool ble_delete_slot_bond(int slot) {
+  if (!ble_peer_recorded(slot)) return false;
+  ble_addr_t a;
+  a.type = ble_slot_peer[slot - 1][0];
+  memcpy(a.val, ble_slot_peer[slot - 1] + 1, 6);
+  bool ok = NimBLEDevice::deleteBond(NimBLEAddress(a));
+  memset(ble_slot_peer[slot - 1], 0, 7);
+  ble_save_peer(slot);
+  return ok;
+}
 
 // ---- Start / stop -----------------------------------------------------------------------------------------------
 static void ble_start() {
@@ -141,7 +228,13 @@ static void ble_start() {
   NimBLEDevice::init(ble_name);
   NimBLEDevice::setSecurityAuth(true, false, true);          // bonding, no MITM (Just Works), LE Secure Connections
   NimBLEDevice::setSecurityIOCap(BLE_HS_IO_NO_INPUT_OUTPUT);
-  if (ble_clear_bonds_pending) { NimBLEDevice::deleteAllBonds(); ble_clear_bonds_pending = false; }
+  if (ble_clear_bonds_pending) {
+    NimBLEDevice::deleteAllBonds(); ble_clear_bonds_pending = false; ble_clear_slot_mask = 0;
+    for (int i = 0; i < BLE_SLOT_COUNT; i++) { memset(ble_slot_peer[i], 0, 7); ble_save_peer(i + 1); }
+  }
+  for (int s = 1; s <= BLE_SLOT_COUNT; s++) if (ble_clear_slot_mask & (1 << (s - 1))) ble_delete_slot_bond(s);
+  ble_clear_slot_mask = 0;
+  ble_apply_identity();                                       // BEFORE advertising starts
 
   ble_server = NimBLEDevice::createServer();
   ble_server->setCallbacks(&ble_server_cb);
@@ -165,7 +258,7 @@ static void ble_start() {
   ble_running = true;
   ble_st = BLE_ST_ADV;
   ble_status_dirty = true;
-  Serial.printf("BLE: advertising as \"%s\" (bonds: %d, free heap %u)\n", ble_name, NimBLEDevice::getNumBonds(), (unsigned)ESP.getFreeHeap());
+  Serial.printf("BLE: advertising as \"%s\" slot %d (%s) (bonds: %d, free heap %u)\n", ble_name, ble_slot, ble_slot_names[ble_slot - 1], NimBLEDevice::getNumBonds(), (unsigned)ESP.getFreeHeap());
 }
 
 static void ble_stop() {
@@ -205,10 +298,52 @@ static bool ble_notify_media(uint16_t usage) {
   return true;
 }
 
+// Persist a finished pairing to the slot that was active when it happened (called from the main loop only).
+static void ble_flush_bond() {
+  if (!ble_bond_pending) return;
+  ble_bond_pending = false;
+  memcpy(ble_slot_peer[ble_slot - 1], ble_bond_peer_tmp, 7);
+  ble_save_peer(ble_slot);
+}
+
+// Brief "BT: <slot name>" pill over the header area (same spot/style as the alert banner), then the page is repainted.
+static void ble_show_toast() {
+  if (is_sleeping || is_deep_sleeping) return;     // nobody is looking; the wake path redraws the page anyway
+  const int x = 8, y = 5, h = 40, w = screenWidth - 16;
+  gfx->fillRoundRect(x, y, w, h, h / 2, gfx->color565(153, 153, 204));   // LCARS violet
+  gfx->setTextSize(3);
+  gfx->setTextColor(0x0000);
+  gfx->setCursor(x + 28, y + 8);
+  gfx->print("BT: ");
+  gfx->print(ble_slot_names[ble_slot - 1]);
+  gfx->setTextSize(2);
+  ble_toast_until = millis() + 1500;
+}
+
+// Switch the active host slot: drop the current host, change identity, advertise again. Caller checked ble_enabled.
+static void ble_switch_slot(int n) {
+  ble_flush_bond();                                // attribute a just-finished pairing to the OLD slot
+  if (n != ble_slot) {
+    bool was = ble_running;
+    if (was) ble_stop();                           // disconnects the current host and tears the stack down
+    ble_slot = (uint8_t)n;
+    ble_save();
+    if (ble_enabled) ble_start();                  // re-init with the new identity; bonds for all slots stay in NVS
+    (void)was;
+  }
+  ble_status_dirty = true;
+  ble_show_toast();
+}
+
 void ble_loop() {
   if (ble_status_dirty) {                 // tell the net module (emits NET_STATUS, rate-limited there)
     ble_status_dirty = false;
     net_status_changed();
+  }
+  ble_flush_bond();
+  if (ble_toast_until && (int32_t)(millis() - ble_toast_until) >= 0) {
+    ble_toast_until = 0;
+    if (!is_sleeping && !is_deep_sleeping) draw_page(current_page);       // remove the toast (the alert banner self-heals if active)
   }
   if (!ble_running) return;
   unsigned long now = millis();
@@ -266,33 +401,84 @@ void ble_loop() {
 }
 
 bool ble_command(const String& c) {
+  if (c.startsWith("BLE_HOST:")) {                         // BLE_HOST:<1|2|3|next>
+    if (!ble_enabled) { Serial.println("BLE_HOST:err:ble_off"); return true; }
+    int n = ble_slot_parse_arg(c.substring(9).c_str(), ble_slot);
+    if (!n) { Serial.println("BLE_HOST:err:bad_slot"); return true; }
+    ble_switch_slot(n);                                     // no-op restart if it is already the active slot
+    Serial.printf("BLE_HOST:%d\n", n);
+    return true;
+  }
   if (!c.startsWith("SET_BLE:")) return false;
   JsonDocument d;
   if (deserializeJson(d, c.substring(8)) != DeserializationError::Ok || !d.is<JsonObject>()) {
     Serial.println("BLE_SET:err:bad_json");
     return true;
   }
-  bool hasEn = !d["enabled"].isNull(), hasName = !d["name"].isNull(), clear = d["clear_bonds"] | false;
-  if (!hasEn && !hasName && !clear) { Serial.println("BLE_SET:err:no_fields"); return true; }
+  // clear_bonds: true = all slots, 1..3 = that slot only, false/absent = nothing (stock behaviour: false was never a "field").
+  bool clearAll = false;
+  int clearSlot = 0;
+  JsonVariant cb = d["clear_bonds"];
+  if (!cb.isNull()) {
+    if (cb.is<bool>()) clearAll = cb.as<bool>();
+    else if (cb.is<int>() && cb.as<int>() >= 1 && cb.as<int>() <= BLE_SLOT_COUNT) clearSlot = cb.as<int>();
+    else { Serial.println("BLE_SET:err:bad_clear"); return true; }
+  }
+  bool hasEn = !d["enabled"].isNull(), hasName = !d["name"].isNull(), hasSlots = !d["slots"].isNull();
+  if (!hasEn && !hasName && !hasSlots && !clearAll && !clearSlot) { Serial.println("BLE_SET:err:no_fields"); return true; }
   if (hasEn && !d["enabled"].is<bool>()) { Serial.println("BLE_SET:err:bad_enabled"); return true; }
   const char* nm = nullptr;
   if (hasName) {
     if (!d["name"].is<const char*>() || !ble_name_valid(d["name"].as<const char*>())) { Serial.println("BLE_SET:err:bad_name"); return true; }
     nm = d["name"].as<const char*>();
   }
+  // slots: 1..3 names, applied to slots 1..k (the rest keep their current names). Validate everything before changing anything.
+  const char* sn[BLE_SLOT_COUNT] = { nullptr, nullptr, nullptr };
+  size_t nslots = 0;
+  if (hasSlots) {
+    if (!d["slots"].is<JsonArray>()) { Serial.println("BLE_SET:err:bad_slots"); return true; }
+    JsonArray arr = d["slots"].as<JsonArray>();
+    if (arr.size() < 1 || arr.size() > BLE_SLOT_COUNT) { Serial.println("BLE_SET:err:bad_slots"); return true; }
+    for (JsonVariant v : arr) {
+      if (!v.is<const char*>() || !ble_slot_name_valid(v.as<const char*>())) { Serial.println("BLE_SET:err:bad_slots"); return true; }
+      sn[nslots++] = v.as<const char*>();
+    }
+  }
 
   bool newEnabled = hasEn ? d["enabled"].as<bool>() : ble_enabled;
   bool renamed = nm && strcmp(nm, ble_name) != 0;
   if (nm) { strncpy(ble_name, nm, sizeof(ble_name) - 1); ble_name[sizeof(ble_name) - 1] = 0; }
+  for (size_t i = 0; i < nslots; i++) { strncpy(ble_slot_names[i], sn[i], BLE_SLOT_NAME_MAX); ble_slot_names[i][BLE_SLOT_NAME_MAX] = 0; }
   ble_enabled = newEnabled;
   ble_save();
+  if (nslots) ble_status_dirty = true;                          // NET_STATUS carries the slot names
 
   if (ble_running && (!newEnabled || renamed)) ble_stop();     // rename needs a stack restart (name is set at init)
-  if (clear) {
-    if (ble_running) NimBLEDevice::deleteAllBonds(); else ble_clear_bonds_pending = true;   // applied at next start
+  if (clearAll) {
+    if (ble_running) {
+      NimBLEDevice::deleteAllBonds();
+      for (int i = 0; i < BLE_SLOT_COUNT; i++) { memset(ble_slot_peer[i], 0, 7); ble_save_peer(i + 1); }
+    } else ble_clear_bonds_pending = true;                      // applied at next start
+  } else if (clearSlot) {
+    if (ble_running) ble_delete_slot_bond(clearSlot); else ble_clear_slot_mask |= (uint8_t)(1 << (clearSlot - 1));
   }
   if (newEnabled && !ble_running) ble_start();
   Serial.println("BLE_SET:ok");
+  return true;
+}
+
+// Device-local button: "blehost" switches the BLE host slot ON THE DECK, even when a host app is connected
+// (like "goto"; hooked at the top of send_pc_command in smart_deck.ino). Returns true if it consumed the press.
+bool ble_local_button(JsonObject cfg) {
+  const char* type = cfg["type"] | "";
+  if (strcmp(type, "blehost") != 0) return false;
+  int n = 0;
+  JsonVariant s = cfg["slot"];
+  if (s.is<int>()) { int v = s.as<int>(); n = (v >= 1 && v <= BLE_SLOT_COUNT) ? v : 0; }
+  else if (s.is<const char*>()) n = ble_slot_parse_arg(s.as<const char*>(), ble_slot);
+  if (!n) { Serial.println("BLE: blehost button has a bad slot"); return true; }
+  if (!ble_enabled) { Serial.println("BLE: blehost pressed but Bluetooth is disabled (SET_BLE enabled)"); return true; }
+  ble_switch_slot(n);
   return true;
 }
 
