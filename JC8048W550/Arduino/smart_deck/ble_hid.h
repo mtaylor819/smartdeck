@@ -32,6 +32,9 @@ const char* ble_state_str() {
   }
 }
 String ble_peer_str() { return String(ble_peer); }
+// v3 contract stubs (fork "blehost" replaces these with the real slot logic; keep the signatures):
+int ble_slot_num() { return 1; }
+String ble_slots_json() { return String("[]"); }
 
 // ---- State -------------------------------------------------------------------------------------------------------
 static bool ble_enabled = false;                 // persisted ("ble"/"en"); default off until SET_BLE

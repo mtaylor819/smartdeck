@@ -24,7 +24,9 @@ static const uint16_t NET_OTA_PORT = 7779;  // HTTP POST /update
 
 // Cross-module API (signatures are a CONTRACT with ble_hid.h; do not change):
 const char* ble_state_str();   // "off" | "advertising" | "connected"   (implemented in ble_hid.h)
-String ble_peer_str();         // connected peer description or ""        (implemented in ble_hid.h)
+String ble_peer_str();
+int ble_slot_num();             // current BLE host slot 1..3   (implemented in ble_hid.h)
+String ble_slots_json();       // JSON array of slot names, e.g. ["Mac","PC"]  (implemented in ble_hid.h)         // connected peer description or ""        (implemented in ble_hid.h)
 static bool net_status_dirty = false;
 void net_status_changed() { net_status_dirty = true; }  // BLE/other modules call this when their state changes
 

@@ -60,3 +60,35 @@ Text lines, `\n` terminated, same on every link (USB serial 115200, WiFi TCP). B
   `hold:true` (NEW) = long-press emits BTN_HOLD.
 - Key combo tokens (device parser): modifiers `ctrl|control`, `shift`, `alt|option|opt`, `cmd|command|meta|win|super` (GUI),
   keys: a-z, 0-9, f1-f24, arrows, enter/return, esc, tab, space, backspace/delete, home/end/pageup/pagedown, punctuation.
+
+
+# v3 additions
+
+## Capabilities
+- `NET_STATUS` gains `"caps":[...]` (strings the firmware supports): `"btn_live"`, `"ha_state"`, `"ble_hosts"`. The host only uses a
+  feature if its cap is listed (stock/older firmware omits `caps`).
+
+## Live button updates (RAM only)
+- `SET_BTN_LIVE:<page>:<idx>:<json>` json keys (all optional): `label` (<=24 chars), `labelColor`, `btnColor` (6 hex), `labelSize` (8..40),
+  `icon` (filename). Updates how that button is DRAWN, in RAM only: never writes the SD card, never wakes the deck, never changes
+  what the button does. Redraws just that button if its page is showing and the deck is awake; otherwise applied at next draw.
+  Overrides survive page changes and wake, and are lost on reboot (host re-sends). MUST NOT leak heap: 100k updates must not
+  grow memory (fixed-size override table; do not mutate the ArduinoJson doc with new strings). No reply (no serial spam).
+  Table size: at least 24 buttons; if full, drop the oldest.
+
+## On-deck Home Assistant state (standalone wall-panel use)
+- Button JSON may carry `"ha_state":{"entity":"light.desk","on":"1a8f3c","off":"333333","label_on":"ON","label_off":"OFF","interval":10}`.
+  Works on any button type (typically `type:"ha"`). When WiFi is up, the deck is awake, and NO host is present (or standalone=always),
+  the deck polls `GET <ha_url>/api/states/<entity>` (Bearer ha_token) for ha_state buttons on the CURRENT page, every `interval`
+  s (default 10, min 5), at most 8 buttons, sequentially in the worker task (3 s timeout). state "on" -> `on` colour/`label_on`;
+  "off" -> `off`/`label_off`; "unavailable"/error -> dim grey and label "?". Applied through the same mechanism as SET_BTN_LIVE.
+  After an `ha` button press, re-poll that entity after ~700 ms. Colours/labels optional (keep the button's own when absent).
+
+## BLE host slots (switch one deck between machines)
+- 3 slots. Each slot advertises with its own identity address (so each machine bonds separately and remembers the deck).
+  `BLE_HOST:<1|2|3|next>` -> disconnect, switch identity, advertise; persisted; reply `BLE_HOST:<n>`; brief on-screen toast `BT: <slot name>`.
+- `SET_BLE` JSON gains `"slots":["Mac","Work PC","iPad"]` (1..3 names, each <=12 printable chars) and `clear_bonds` may be `true` (all)
+  or a slot number.
+- `NET_STATUS` gains `"ble_slot":<1..3>` and `"ble_slots":["Mac",...]`.
+- Button JSON `"type":"blehost","slot":1|2|3|"next"` is DEVICE-LOCAL: it runs on the deck every time, even when a host is connected
+  (like `goto`); it is never sent to the host as BTN.

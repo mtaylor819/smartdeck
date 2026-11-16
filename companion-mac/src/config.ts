@@ -27,11 +27,35 @@ export interface Widget {
   thresholds?: Array<{ above: number; color: string }>;
 }
 
+/** Show a Home Assistant entity's state on the button itself (polled by the deck when standalone, by the Mac otherwise). */
+export interface HaStateDisplay {
+  entity: string;
+  on?: string; off?: string; // 6-hex button colours
+  label_on?: string; label_off?: string;
+  interval?: number; // seconds, min 5, default 10
+}
+
+/** Turn an external event into an LED-ring alert on the deck. Implemented in triggers.ts. */
+export interface TriggerConfig {
+  name: string;
+  enabled?: boolean;
+  source:
+    | { type: 'moonraker'; url: string; on: 'finished' | 'error' | 'finished_or_error' }
+    | { type: 'ha_state'; entity: string; equals?: string; notEquals?: string }
+    | { type: 'http_json'; url: string; jsonPath: string; op: '>' | '<' | '==' | '!=' | 'contains'; value: string | number }
+    | { type: 'github'; repo: string; tokenEnv?: string }
+    | { type: 'command'; command: string; on?: 'nonzero' | 'output'; match?: string };
+  alert: { kind: 'red' | 'yellow' | 'blue' | 'green'; seconds?: number; text?: string };
+  interval?: number; // poll seconds, default 30, min 10
+  cooldownMin?: number; // minutes before it may fire again, default 5
+}
+
 export interface Button extends ButtonStyle {
   action: Action;
   /** Optional second action run on a long press (the deck then sends BTN_HOLD instead of BTN). */
   hold?: Action;
   widget?: Widget;
+  haState?: HaStateDisplay;
 }
 
 export interface KnobConfig {
@@ -63,6 +87,7 @@ export interface Config {
   /** The deck itself: how to reach it over WiFi, and what it should do on its own (WiFi/BLE/standalone). */
   device?: DeviceConfig;
   /** Host-side day/night brightness (applied by the daemon each minute). Overnight ranges (22:00-07:00) work. */
+  triggers?: TriggerConfig[];
   brightnessSchedule?: Array<{ from: string; to: string; brightness: number }>;
   /** Which screen the deck shows while asleep. 'diag' = starship-style system diagnostics (needs the updated firmware). */
   sleepScreen?: 'clock' | 'diag' | 'diag-anim' | 'warp';
@@ -79,7 +104,7 @@ export interface DeviceConfig {
   wifi?: { ssid: string; password?: string };
   tz?: string; // POSIX TZ, e.g. "GMT0BST,M3.5.0/1,M10.5.0/2"
   standalone?: 'auto' | 'always' | 'never';
-  ble?: { enabled: boolean; name?: string };
+  ble?: { enabled: boolean; name?: string; /** names of the 3 host slots */ slots?: string[] };
   /** Home Assistant the *deck* talks to directly when standalone. */
   ha?: { url: string; token?: string };
   autodim?: { enabled: boolean; min: number; max: number; luxLow?: number; luxHigh?: number };
@@ -185,6 +210,7 @@ export function toDeviceButton(b: Button | null): Record<string, unknown> | null
   if (b.btnColor !== undefined) out.btnColor = b.btnColor;
   if (b.icon !== undefined) out.icon = b.icon;
   if (b.hold) out.hold = true;
+  if (b.haState) out.ha_state = b.haState;
   const a = b.action;
   out.type = a.type;
   switch (a.type) {
@@ -199,6 +225,7 @@ export function toDeviceButton(b: Button | null): Record<string, unknown> | null
     case 'toggle': if (a.onColor) out.toggleData = { onColor: a.onColor }; break;
     case 'http': out.http = { url: a.url, ...(a.method ? { method: a.method } : {}), ...(a.body ? { body: a.body } : {}), ...(a.headers ? { headers: a.headers } : {}) }; break;
     case 'media': out.media = a.key; break;
+    case 'blehost': out.slot = a.slot; break;
     case 'ha': out.ha = { service: a.service, ...(a.entity ? { entity: a.entity } : {}), ...(a.data ? { data: a.data } : {}) }; break;
   }
   return out;

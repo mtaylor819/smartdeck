@@ -23,6 +23,7 @@ export interface NetStatus {
   wifi?: 'off' | 'connecting' | 'connected';
   ip?: string; rssi?: number; host?: string; ssid?: string; clients?: number;
   ota?: boolean; ntp?: boolean; ble?: 'off' | 'advertising' | 'connected'; ble_peer?: string; fw?: string;
+  caps?: string[]; ble_slot?: number; ble_slots?: string[];
 }
 
 const ints = (s: string): number[] => s.split(':').map((n) => parseInt(n, 10));
@@ -125,6 +126,9 @@ export const cmd = {
     `${Math.max(0, Math.round(d.rx))}:${Math.max(0, Math.round(d.tx))}:${Math.max(0, Math.round(d.uptimeMin))}:` +
     d.host.replace(/[^A-Za-z0-9._-]/g, '').slice(0, 16),
   hb: () => 'HB',
+  setBtnLive: (page: number, index: number, o: { label?: string; labelColor?: string; btnColor?: string; labelSize?: number; icon?: string }) =>
+    `SET_BTN_LIVE:${page}:${index}:${JSON.stringify(o)}`,
+  bleHost: (slot: 1 | 2 | 3 | 'next') => `BLE_HOST:${slot}`,
   getNet: () => 'GET_NET',
   /** Provisioning blob. Secrets inside: only send over USB (or an authenticated link). */
   setNet: (o: Record<string, unknown>) => `SET_NET:${JSON.stringify(o)}`,

@@ -26,6 +26,7 @@ export type Action =
   | { type: 'paste'; text: string }
   | { type: 'ha'; service: string; entity?: string; data?: Record<string, unknown> }
   | { type: 'alert'; kind: 'red' | 'yellow' | 'blue' | 'green' | 'off'; seconds?: number; text?: string }
+  | { type: 'blehost'; slot: 1 | 2 | 3 | 'next' }
   | { type: 'none' };
 
 export type MediaKey =
