@@ -36,6 +36,7 @@ function uiDir(): string {
 
 const STATIC: Record<string, string> = {
   '/app.js': 'application/javascript; charset=utf-8',
+  '/lcars.js': 'application/javascript; charset=utf-8',
   '/style.css': 'text/css; charset=utf-8',
 };
 

@@ -88,6 +88,11 @@ export const cmd = {
   setDeepSleep: (minutes: number) => `SET_DEEP_SLEEP:${Math.max(0, Math.round(minutes))}`,
   setDimLed: (anim: string) => `SET_DIM_LED:${anim}`,
   setLedBrightness: (n: number) => `SET_LED_BRIGHTNESS:${clamp(Math.round(n), 0, 255)}`,
+  setSleepScreen: (mode: 'clock' | 'diag') => `SET_SLEEP_SCREEN:${mode}`,
+  diag: (d: { cpu: number; mem: number; disk: number; rx: number; tx: number; uptimeMin: number; host: string }) =>
+    `DIAG:${clamp(Math.round(d.cpu), 0, 100)}:${clamp(Math.round(d.mem), 0, 100)}:${clamp(Math.round(d.disk), 0, 100)}:` +
+    `${Math.max(0, Math.round(d.rx))}:${Math.max(0, Math.round(d.tx))}:${Math.max(0, Math.round(d.uptimeMin))}:` +
+    d.host.replace(/[^A-Za-z0-9._-]/g, '').slice(0, 16),
   setPage: (page: number) => `SET_PAGE:${page}`,
   setKnobLed: (r: number, g: number, b: number, tail: number) =>
     `SET_KNOB:${clamp(r, 0, 255)}:${clamp(g, 0, 255)}:${clamp(b, 0, 255)}:${clamp(tail, 1, 15)}`,

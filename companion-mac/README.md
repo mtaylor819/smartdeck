@@ -16,7 +16,9 @@ parameters such as app names, URLs and scripts never go to the device.
 | Knob (steps, direction, wraparound), deck power/LED/brightness settings | Done, tested |
 | Live widgets (clock, cpu, memory, now playing, HA state, JSON URL, Moonraker) | Done, tested |
 | App-based page switching, weather (Open-Meteo) | Done, tested |
-| Web UI (localhost, CSRF/Host/Origin protected) | Served and API-checked; **not yet viewed in a browser** |
+| Web UI: LCARS look with 3 colour schemes (TNG, Voyager, Picard), interface sounds | Rendered and checked in headless Chromium; drag-and-drop/upload not exercised |
+| Mac-side press/error sounds (`sounds` in config; synthesized WAVs in `sounds/`) | Done, tested (afplay on a real Mac untested) |
+| Starship-diagnostics sleep screen (`sleepScreen: "diag"`) | Mac sender done + tested; firmware side compile-checked only, **never seen on a real screen** |
 | `flash` (esptool), `install-service` (launch at login) | Done; flashing unverified on hardware |
 | **Real macOS / real deck** | **Not yet verified** (built on Linux, no hardware) |
 
@@ -41,6 +43,15 @@ Config lives at `~/Library/Application Support/SmartDeckMac/config.json` (overri
 
 **macOS permissions** (first run will prompt): grant *Accessibility* to your terminal (or the
 packaged app) so `System Events` keystrokes and media keys work.
+
+## Look & sound
+
+- **Colour scheme:** the dropdown in the header (TNG / Voyager / Picard). Remembered per browser.
+- **Interface sounds:** the *Sound* button toggles synthesized beeps in the web UI (no audio files).
+- **Deck sounds on the Mac:** Settings → Sounds, or in config: `"sounds": {"press": "chirp", "error": "error", "volume": 50}`.
+  Built-ins: `chirp`, `confirm`, `error`, `blip` (regenerate with `node scripts/make-sounds.mjs`), or any absolute file path.
+- **Diagnostics sleep screen:** set `"sleepScreen": "diag"` (Settings → Sleep screen). Needs the updated firmware in `../firmware/`.
+  The Mac sends CPU, memory, disk, network and uptime every 5 s.
 
 ## Config example
 

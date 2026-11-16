@@ -16,7 +16,11 @@ Done in the Mac companion: see README. Ideas below are ranked by value for our o
 6. **Per-page knob actions** – `SET_KNOB_ACTION` exists in the firmware comments; surface it.
 7. **Knob push / haptics** – if the hardware gets a button on the encoder.
 
+## Done since the first roadmap
+- Diagnostics sleep screen (firmware + Mac sender), LCARS web UI, 3 colour schemes, sounds.
+
 ## Companion
+- LCARS colour scheme for the deck's own button screen (theme colours via `SET_THEME`) matching the chosen UI scheme.
 - Native menu-bar item (SwiftBar plugin or Tauri shell) instead of opening the UI in a browser.
 - Keychain storage for the Home Assistant token (`security add-generic-password`).
 - Import of the Windows app's presets (Adobe, Blender, OBS...) translated ctrl→cmd.

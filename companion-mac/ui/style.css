@@ -14,15 +14,30 @@ html, body { background: var(--bg); }
 body { margin: 0; color: var(--text); font: 15px/1.4 var(--font); letter-spacing: .02em; }
 button, input, select, textarea { font: inherit; color: inherit; }
 
+/* ---------- colour schemes (set via <html data-theme>) ----------
+   Variable names are historical (TNG palette); each scheme remaps them. --orange is the primary bar colour. */
+:root[data-theme="voyager"] {
+  --bg: #000; --surface: #07091a; --surface2: #11152b; --text: #d6dcff; --muted: #8c95c0; --border: #34406a;
+  --orange: #8da0e8; --peach: #d98aa8; --tan: #f0c9a0; --lilac: #b69be0; --violet: #6f86c8;
+  --blue: #9fd0f5; --salmon: #d9667a; --gold: #ffb347; --ok: #9dffb8; --danger: #ff6b7d;
+}
+:root[data-theme="picard"] {
+  --bg: #02070d; --surface: #050e16; --surface2: #0b1a26; --text: #cfeaf2; --muted: #7a98a8; --border: #1f3a4d;
+  --orange: #46c8e8; --peach: #e8743b; --tan: #bfe3ee; --lilac: #7aa3d8; --violet: #3f7fb5;
+  --blue: #8fe0f0; --salmon: #e0523f; --gold: #f2b134; --ok: #7dffb0; --danger: #ff6a55;
+}
+select#themeSel { width: auto; height: 32px; padding: 0 14px; background: var(--tan); color: #000; border: 0; border-radius: 16px; text-transform: uppercase; letter-spacing: .1em; font-weight: 600; font-size: 13px; cursor: pointer; }
+select#themeSel option { background: #000; color: #fff; }
+
 /* ---------- frame ---------- */
-#frame { display: grid; grid-template-columns: var(--rail) 1fr; grid-template-rows: var(--elbow-h) 1fr auto; gap: var(--gap); min-height: 100vh; padding: 10px 14px 10px 10px; }
+#frame { display: grid; grid-template-columns: var(--rail) minmax(0, 1fr); grid-template-rows: var(--elbow-h) 1fr auto; gap: var(--gap); min-height: 100vh; padding: 10px 14px 10px 10px; }
 .elbow { background: var(--orange); position: relative; }
 .elbow.top { grid-area: 1 / 1; border-top-left-radius: 70px; }
 .elbow.top::after { content: ""; position: absolute; left: 100%; top: var(--bar); width: 34px; height: 34px;
   background: radial-gradient(circle at 100% 100%, transparent 33px, var(--orange) 34px); margin-left: calc(-1px); }
 .elbow.bottom { grid-area: 3 / 1; height: 34px; background: var(--violet); border-bottom-left-radius: 34px; }
 
-#topbar { grid-area: 1 / 2; align-self: start; display: flex; align-items: center; gap: var(--gap); height: var(--bar); padding-left: 38px; background: transparent; flex-wrap: nowrap; position: relative; }
+#topbar { grid-area: 1 / 2; align-self: start; display: flex; align-items: center; gap: var(--gap); height: var(--bar); padding-left: 38px; background: transparent; flex-wrap: nowrap; position: relative; min-width: 0; }
 #topbar::before { content: ""; position: absolute; left: 0; top: 0; width: 34px; height: var(--bar); background: var(--orange); }
 .brand { background: var(--orange); color: #000; height: var(--bar); display: flex; align-items: center; padding: 0 18px; border-radius: 0 22px 22px 0; font-weight: 700; font-size: 20px; text-transform: uppercase; letter-spacing: .12em; white-space: nowrap; margin-left: -4px; }
 .brand .sub { font-size: 12px; font-weight: 500; margin-left: 10px; letter-spacing: .1em; opacity: .75; }
@@ -78,7 +93,7 @@ h3 { font-size: 17px; } h4 { font-size: 14px; color: var(--lilac); }
 #grid { display: grid; gap: 10px; width: 100%; max-width: 760px; margin: 0 auto; }
 .cell { aspect-ratio: 1; border-radius: 22px 22px 22px 22px; border: 2px solid transparent; position: relative; overflow: hidden; cursor: pointer; display: flex; align-items: flex-end; justify-content: center; }
 .cell.empty { border: 2px dashed var(--border); background: transparent; color: var(--muted); align-items: center; font-size: 24px; }
-.cell.selected { border-color: var(--orange); box-shadow: 0 0 0 3px var(--orange), 0 0 16px rgba(255,153,0,.45); }
+.cell.selected { border-color: var(--orange); box-shadow: 0 0 0 3px var(--orange), 0 0 16px color-mix(in srgb, var(--orange) 45%, transparent); }
 .cell.dragover { outline: 2px dashed var(--blue); outline-offset: 2px; }
 .cell img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
 .cell .lbl { position: relative; padding: 3px 6px; font-size: 13px; font-weight: 700; text-align: center; text-transform: uppercase; letter-spacing: .06em; text-shadow: 0 1px 3px rgba(0,0,0,.8); max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -109,6 +124,10 @@ h3 { font-size: 17px; } h4 { font-size: 14px; color: var(--lilac); }
 #logDrawer { position: fixed; right: 0; top: 60px; bottom: 0; width: min(500px, 100vw); background: var(--surface); border-left: 14px solid var(--blue); border-radius: 26px 0 0 0; padding: 8px 16px; overflow: auto; z-index: 10; }
 #logDrawer pre { white-space: pre-wrap; font-size: 12px; margin: 0; color: var(--tan); }
 [hidden] { display: none !important; }
+
+/* ---------- medium screens: tighten the header so every control stays reachable ---------- */
+@media (max-width: 1500px) { .brand .sub { display: none; } }
+@media (max-width: 1340px) { #topbar { flex-wrap: wrap; height: auto; min-height: var(--bar); } #topbar .spacer { display: none; } }
 
 /* ---------- narrow screens: drop the rail ---------- */
 @media (max-width: 760px) {

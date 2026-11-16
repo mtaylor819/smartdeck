@@ -175,3 +175,18 @@ test('unknown routes 404, sync/status work', async () => {
   assert.equal(j(await req('GET', '/api/status')).deviceName, 'Smart Deck');
   assert.equal((await req('POST', '/api/sync')).status, 200);
 });
+
+test('serves lcars.js and every script referenced by index.html', async () => {
+  const { startServer } = await import('../src/server.js');
+  const srv = await startServer({
+    getConfig: () => ({}) as any, setConfig() {}, status: () => ({ connected: false, page: 0, log: [], widgets: {} }),
+    sync: async () => {}, testAction: async () => {}, iconsDir: () => '/nonexistent', iconsChanged() {},
+  } as any, { port: 0 });
+  try {
+    const html = await (await fetch(srv.url)).text();
+    const scripts = [...html.matchAll(/<script src="([^"]+)"/g)].map((m) => m[1]);
+    assert.ok(scripts.includes('/lcars.js'));
+    for (const s of scripts) assert.equal((await fetch(srv.url.replace(/\/$/, '') + s)).status, 200, s);
+    assert.equal((await fetch(srv.url.replace(/\/$/, '') + '/style.css')).status, 200);
+  } finally { await srv.close(); }
+});

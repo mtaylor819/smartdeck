@@ -58,6 +58,10 @@ export interface Config {
     homeassistant?: { url: string; token?: string; tokenEnv?: string };
   };
   ui?: { port?: number };
+  /** Which screen the deck shows while asleep. 'diag' = starship-style system diagnostics (needs the updated firmware). */
+  sleepScreen?: 'clock' | 'diag';
+  /** Mac-side audio feedback. press/error are a built-in name (chirp|confirm|error|blip), an absolute file path, or 'none'. */
+  sounds?: { press?: string; error?: string; volume?: number };
 }
 
 export const defaultConfig = (): Config => ({
@@ -124,6 +128,10 @@ export function validate(c: Config): Config {
       throw new Error(`page ${i} has ${p.buttons.length} buttons but the grid only has ${cells} cells`);
   });
   if (!(c.knob.step > 0)) throw new Error('knob.step must be > 0');
+  if (c.sleepScreen !== undefined && c.sleepScreen !== 'clock' && c.sleepScreen !== 'diag')
+    throw new Error("sleepScreen must be 'clock' or 'diag'");
+  const v = c.sounds?.volume;
+  if (v !== undefined && !(v >= 0 && v <= 100)) throw new Error('sounds.volume must be 0-100');
   return c;
 }
 

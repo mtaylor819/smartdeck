@@ -1,6 +1,8 @@
 import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
-import { ActionExecutor, Action, defaultCapture, Capture, Runner } from './actions.js';
+import { ActionExecutor, Action, defaultCapture, defaultRunner, Capture, Runner } from './actions.js';
+import { DiagCollector, makeCpuMeter } from './diag.js';
+import { SoundPlayer } from './sounds.js';
 import { AppWatcher } from './appwatch.js';
 import type { DaemonApi, DeckStatus } from './api.js';
 import { Config, configPath, loadConfig, validate, writeDefaultConfig } from './config.js';
@@ -11,6 +13,7 @@ import { defaultCpuTimes, WidgetManager } from './widgets.js';
 import { weatherLine } from './weather.js';
 
 const WEATHER_EVERY_MS = 15 * 60_000;
+const DIAG_EVERY_MS = 5_000;
 
 export interface DaemonOptions {
   configFile?: string;
@@ -32,6 +35,9 @@ export class Daemon implements DaemonApi {
   private widgets: WidgetManager;
   private appWatch: AppWatcher;
   private weatherTimer?: NodeJS.Timeout;
+  private diagTimer?: NodeJS.Timeout;
+  private diag: DiagCollector;
+  private sounds: SoundPlayer;
   private readonly file: string;
   private readonly capture: Capture;
   private readonly fetchImpl: typeof fetch;
@@ -50,6 +56,8 @@ export class Daemon implements DaemonApi {
       { capture: this.capture, fetchImpl: this.fetchImpl, ha, cpuTimes: defaultCpuTimes },
       (m) => this.log(m),
     );
+    this.diag = new DiagCollector(this.capture, makeCpuMeter());
+    this.sounds = new SoundPlayer(() => this.config, opts.runner ?? defaultRunner, (m) => this.log(m));
     this.appWatch = new AppWatcher(() => this.config, this.capture, (p) => this.send(cmd.setPage(p)), (m) => this.log(m));
   }
 
@@ -134,6 +142,8 @@ export class Daemon implements DaemonApi {
       if (pw?.deepSleepMinutes !== undefined) await this.deck.send(cmd.setDeepSleep(pw.deepSleepMinutes));
       if (pw?.dimLed) await this.deck.send(cmd.setDimLed(pw.dimLed));
       if (pw?.ledBrightness !== undefined) await this.deck.send(cmd.setLedBrightness(pw.ledBrightness));
+      if (c.sleepScreen) await this.deck.send(cmd.setSleepScreen(c.sleepScreen));
+      await this.pushDiag();
       await this.pushWeather();
     } catch (e) {
       this.log(`apply settings: ${e instanceof Error ? e.message : e}`);
@@ -150,10 +160,20 @@ export class Daemon implements DaemonApi {
     }
   }
 
+  private async pushDiag(): Promise<void> {
+    if (this.config.sleepScreen !== 'diag' || !this.deck) return;
+    try {
+      await this.deck.send(await this.diag.line());
+    } catch (e) {
+      this.log(`diagnostics: ${e instanceof Error ? e.message : e}`);
+    }
+  }
+
   // ---- lifecycle ----
   async run(): Promise<void> {
     this.appWatch.start();
     this.weatherTimer = setInterval(() => void this.pushWeather(), WEATHER_EVERY_MS);
+    this.diagTimer = setInterval(() => void this.pushDiag(), DIAG_EVERY_MS);
     while (!this.stopped) {
       const candidates = this.opts.port ? [this.opts.port] : await listCandidatePorts();
       const found = await findDeck(candidates);
@@ -164,7 +184,7 @@ export class Daemon implements DaemonApi {
       this.portPath = found.path;
       this.deviceName = found.name;
       this.log(`connected to "${found.name}"`);
-      const deck = new Deck(found.transport as SerialTransport, () => this.config, this.exec, (m) => this.log(m));
+      const deck = new Deck(found.transport as SerialTransport, () => this.config, this.exec, (m) => this.log(m), undefined, (k) => this.sounds.play(k));
       this.deck = deck;
       found.transport.on('error', (e: Error) => this.log(`serial error: ${e.message}`));
       const closed = new Promise<void>((r) => deck.once('close', r));
@@ -188,6 +208,7 @@ export class Daemon implements DaemonApi {
     this.widgets.stop();
     this.appWatch.stop();
     if (this.weatherTimer) clearInterval(this.weatherTimer);
+    if (this.diagTimer) clearInterval(this.diagTimer);
     await this.deck?.close();
   }
 }

@@ -40,6 +40,7 @@ function toast(msg, isError) {
   const t = $('toast');
   t.textContent = msg;
   t.className = 'show' + (isError ? ' error' : '');
+  if (window.lcarsSound) window.lcarsSound(isError ? 'error' : 'confirm');
   clearTimeout(toast.t);
   toast.t = setTimeout(() => (t.className = ''), isError ? 5000 : 2200);
 }
@@ -83,6 +84,7 @@ function trimConfig(cfg) {
   // Drop empty optional sections the settings view creates as editing scaffolding.
   if (out.power && !Object.keys(out.power).length) delete out.power;
   if (!out.weather) delete out.weather;
+  if (out.sounds && !Object.keys(out.sounds).length) delete out.sounds;
   if (out.appPages) {
     out.appPages = out.appPages.filter((r) => r.app);
     if (!out.appPages.length) delete out.appPages;
@@ -497,6 +499,22 @@ function drawSettings() {
       ['off', 'breathing', 'rainbow', 'pulse', 'comet', 'sparkle'].map((a) => h('option', { value: a, selected: (c.power.dimLed || 'off') === a }, a)))),
     row('LED brightness', num(c.power, 'ledBrightness', { min: 0, max: 255 })));
 
+  c.sounds ||= {};
+  const soundOpts = ['none', 'chirp', 'confirm', 'error', 'blip'];
+  const soundRow = (label, key) => row(label, h('div', {},
+    h('input', { type: 'text', list: 'builtinSounds', placeholder: 'none', value: c.sounds[key] ?? '',
+      oninput: (e) => { if (e.target.value === '') delete c.sounds[key]; else c.sounds[key] = e.target.value; chg(); } })));
+  const soundsBox = h('div', {}, h('h3', {}, 'Sounds (on this Mac)'),
+    h('datalist', { id: 'builtinSounds' }, soundOpts.map((o) => h('option', { value: o }))),
+    soundRow('On button press', 'press'), soundRow('On action error', 'error'),
+    row('Volume %', num(c.sounds, 'volume', { min: 0, max: 100, placeholder: '60' })),
+    h('div', { class: 'muted' }, 'Built-in: chirp, confirm, error, blip — or an absolute path to a .wav/.aiff/.mp3 file.'));
+
+  const sleepBox = h('div', {}, h('h3', {}, 'Sleep screen'),
+    row('Show', h('select', { onchange: (e) => { if (e.target.value === 'clock') delete c.sleepScreen; else c.sleepScreen = e.target.value; chg(); } },
+      [['clock', 'Clock + weather'], ['diag', 'Starship diagnostics']].map(([v, l]) => h('option', { value: v, selected: (c.sleepScreen || 'clock') === v }, l)))),
+    h('div', { class: 'muted' }, 'Diagnostics needs the updated firmware (firmware/ folder): CPU, memory, storage, network, uptime.'));
+
   c.weather ||= null;
   const wBox = h('div', {}, h('h3', {}, 'Weather (sleep screen)'));
   const drawWeather = () => {
@@ -528,7 +546,7 @@ function drawSettings() {
     h('div', { class: 'muted' }, 'A saved token is shown as ***. Leave it to keep the existing token.'));
 
   v.append(h('div', { class: 'inline' }, h('h2', {}, 'Settings'), h('div', { class: 'spacer' }), h('button', { onclick: () => setView('editor') }, '← Back to buttons')),
-    h('div', { class: 'grid2' }, h('div', {}, general, power), h('div', {}, knobBox, wBox, rules, haBox)));
+    h('div', { class: 'grid2' }, h('div', {}, general, power, sleepBox, soundsBox), h('div', {}, knobBox, wBox, rules, haBox)));
 }
 function clampInt(v, lo, hi) { return Math.min(hi, Math.max(lo, Math.round(Number(v)) || lo)); }
 

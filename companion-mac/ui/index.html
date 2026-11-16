@@ -14,6 +14,10 @@
       <div class="brand">SmartDeck <span class="sub">Control Interface</span></div>
       <div id="conn" class="conn off"><span class="dot"></span><span id="connText">Connecting…</span></div>
       <div class="spacer"></div>
+      <select id="themeSel" title="Colour scheme" aria-label="Colour scheme">
+        <option value="tng">TNG</option><option value="voyager">Voyager</option><option value="picard">Picard</option>
+      </select>
+      <button id="soundBtn" class="ghost" title="Interface sounds">Sound: on</button>
       <button id="logBtn" class="ghost">Log</button>
       <button id="settingsBtn" class="ghost">Settings</button>
       <button id="syncBtn">Sync to deck</button>
@@ -45,6 +49,7 @@
 
   <div id="toast" role="status"></div>
   <aside id="logDrawer" hidden><h3>Activity log</h3><pre id="logText"></pre></aside>
+  <script src="/lcars.js" defer></script>
   <script src="/app.js" defer></script>
 </body>
 </html>

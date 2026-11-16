@@ -31,6 +31,7 @@ export class Deck extends EventEmitter {
     private exec: ActionExecutor,
     private log: (msg: string) => void = () => {},
     private now: () => Date = () => new Date(),
+    private feedback: (kind: 'press' | 'error') => void = () => {},
   ) {
     super();
     this.getConfig = typeof cfg === 'function' ? cfg : () => cfg;
@@ -49,6 +50,7 @@ export class Deck extends EventEmitter {
     if (pw?.deepSleepMinutes !== undefined) await this.send(cmd.setDeepSleep(pw.deepSleepMinutes));
     if (pw?.dimLed) await this.send(cmd.setDimLed(pw.dimLed));
     if (pw?.ledBrightness !== undefined) await this.send(cmd.setLedBrightness(pw.ledBrightness));
+    if (this.config.sleepScreen) await this.send(cmd.setSleepScreen(this.config.sleepScreen));
     await this.send(cmd.getSync()); // deck replies with SYNC_PAGE / KNOB_RAW / SYNC_STATE...
   }
 
@@ -72,9 +74,11 @@ export class Deck extends EventEmitter {
         const b = findButton(this.config, ev.page, ev.index);
         if (!b) return this.log(`button ${ev.page}:${ev.index} has no action`);
         this.log(`button ${ev.page}:${ev.index} ${b.label ?? ''} (${b.action.type})`);
+        this.feedback('press');
         try {
           await this.exec.execute(b.action, ev.state);
         } catch (e) {
+          this.feedback('error');
           this.log(`action failed: ${e instanceof Error ? e.message : e}`);
         }
         return;
