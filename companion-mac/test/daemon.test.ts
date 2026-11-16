@@ -175,3 +175,22 @@ test('keychain: a missing item does not crash the daemon (logged, connection jus
     assert.ok(!d.status().log.join('\n').includes('nope-value'));
   } finally { await d.stop(); }
 });
+
+test('a trigger fires an ALERT on the connected deck (command source, edge-triggered, once)', async () => {
+  const deck = await fakeWifiDeck('tok-12345678', true);
+  const { file } = setup(deck.port, true);
+  const cfg = JSON.parse((await import('node:fs')).readFileSync(file, 'utf8'));
+  cfg.triggers = [{ name: 'Backup', source: { type: 'command', command: 'false' }, alert: { kind: 'yellow', seconds: 5, text: 'Backup failed' }, interval: 10, cooldownMin: 5 }];
+  writeFileSync(file, JSON.stringify(cfg));
+  const d = new Daemon({ configFile: file, port: '/dev/null/none', runner: async () => {},
+    capture: async (f, a) => { if (f === '/bin/sh') throw Object.assign(new Error('exit 1'), { code: 1 }); return ''; } });
+  void d.run();
+  try {
+    // The first poll happens before the deck link is up, so the alert is retried at the next poll (interval 10 s minimum).
+    await waitFor(() => deck.received.some((l) => l.startsWith('ALERT:yellow')), 15000);
+    assert.ok(deck.received.includes('ALERT:yellow:5:Backup failed'));
+    assert.equal(d.status().triggers?.Backup?.state, 'firing');
+    await new Promise((r) => setTimeout(r, 1500));
+    assert.equal(deck.received.filter((l) => l.startsWith('ALERT:yellow')).length, 1, 'must not re-fire while the condition persists');
+  } finally { await d.stop(); deck.close(); }
+});

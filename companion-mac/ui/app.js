@@ -642,13 +642,19 @@ function drawSettings() {
   };
   drawSched();
 
+  const trigBox = h('div', {}, h('h3', {}, 'Alert triggers'),
+    h('div', { class: 'muted' }, 'Turn events (print finished, door opened, build failed…) into LED alerts. Alerts fire once when the condition starts.'));
+  const trigHost = h('div', {});
+  trigBox.append(trigHost);
+  if (window.renderTriggersEditor) window.renderTriggersEditor(trigHost, c, chg);
+
   const alertBox = h('div', {}, h('h3', {}, 'Alerts (LED ring)'),
     h('div', { class: 'muted' }, 'Test the ring. Also available as a button action, `smartdeck-mac alert red 30 "text"`, or POST /api/alert.'),
     h('div', { class: 'inline' }, ['red', 'yellow', 'blue', 'green', 'off'].map((k) => h('button', { class: 'small' + (k === 'red' ? ' danger' : ''),
       onclick: async () => { try { await api('POST', '/api/alert', { kind: k, seconds: k === 'off' ? 0 : 10, text: k === 'red' ? 'Red alert' : '' }); } catch (e) { toast(e.message, true); } } }, k))));
 
   v.append(h('div', { class: 'inline' }, h('h2', {}, 'Settings'), h('div', { class: 'spacer' }), h('button', { onclick: () => setView('editor') }, '← Back to buttons')),
-    h('div', { class: 'grid2' }, h('div', {}, general, power, sleepBox, schedBox, soundsBox), h('div', {}, knobBox, connBox, deckBox, alertBox, wBox, rules, haBox)));
+    h('div', { class: 'grid2' }, h('div', {}, general, power, sleepBox, schedBox, soundsBox), h('div', {}, knobBox, connBox, deckBox, alertBox, trigBox, wBox, rules, haBox)));
 }
 function clampInt(v, lo, hi) { return Math.min(hi, Math.max(lo, Math.round(Number(v)) || lo)); }
 
@@ -665,6 +671,7 @@ async function pollStatus() {
   try {
     const s = await api('GET', '/api/status');
     state.status = s;
+    window.__triggerStatus = s.triggers || {};
     $('conn').className = 'conn ' + (s.connected ? 'on' : 'off');
     const n = s.net || {};
     const extra = [s.link === 'wifi' ? 'WiFi' : s.link === 'usb' ? 'USB' : '', n.ble && n.ble !== 'off' ? 'BT ' + n.ble : '', s.lux !== undefined ? s.lux + ' lux' : ''].filter(Boolean).join(' · ');

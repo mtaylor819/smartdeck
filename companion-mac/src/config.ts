@@ -2,6 +2,7 @@ import { mkdirSync, readFileSync, writeFileSync, existsSync } from 'node:fs';
 import { homedir, platform } from 'node:os';
 import { dirname, join } from 'node:path';
 import type { Action } from './actions.js';
+import { validateTriggers } from './triggers.js';
 
 export interface ButtonStyle {
   label?: string;
@@ -199,6 +200,7 @@ export function validate(c: Config): Config {
     }
     if (b?.action?.type === 'blehost' && ![1, 2, 3, 'next'].includes(b.action.slot as any)) throw new Error(`page ${pi + 1} button ${bi + 1}: blehost slot must be 1, 2, 3 or next`);
   }));
+  if (c.triggers !== undefined) validateTriggers(c.triggers);
   for (const r of c.brightnessSchedule ?? []) {
     if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(r.from) || !/^([01]\d|2[0-3]):[0-5]\d$/.test(r.to)) throw new Error('brightnessSchedule times must be HH:MM');
     if (!(r.brightness >= 0 && r.brightness <= 100)) throw new Error('brightnessSchedule brightness must be 0-100');

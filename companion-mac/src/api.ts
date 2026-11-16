@@ -18,6 +18,8 @@ export interface DeckStatus {
   net?: NetStatus;
   /** Latest ambient-light reading (lux), if the deck has a sensor. */
   lux?: number;
+  /** State of each configured alert trigger, keyed by name. */
+  triggers?: Record<string, { state: string; lastFired?: number; lastValue?: string; error?: string }>;
 }
 
 /**

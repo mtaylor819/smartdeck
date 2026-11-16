@@ -12,6 +12,7 @@ import { Config, configPath, loadConfig, validate, writeDefaultConfig } from './
 import { Deck, UploadFile } from './deck.js';
 import { AlertKind, cmd } from './protocol.js';
 import { scheduledBrightness } from './schedule.js';
+import { TriggerEngine } from './triggers.js';
 import { findDeck, listCandidatePorts, TcpTransport, Transport } from './transport.js';
 import { defaultCpuTimes, WidgetManager } from './widgets.js';
 import { weatherLine } from './weather.js';
@@ -42,6 +43,7 @@ export class Daemon implements DaemonApi {
   private exec: ActionExecutor;
   private widgets: WidgetManager;
   private appWatch: AppWatcher;
+  private triggers: TriggerEngine;
   private weatherTimer?: NodeJS.Timeout;
   private diagTimer?: NodeJS.Timeout;
   private schedTimer?: NodeJS.Timeout;
@@ -78,6 +80,10 @@ export class Daemon implements DaemonApi {
       undefined, undefined,
       () => !!this.deck?.net.caps?.includes('btn_live'),
     );
+    this.triggers = new TriggerEngine({
+      getConfig: () => this.resolved, fetchImpl: this.fetchImpl, capture: this.capture, ha,
+      alert: (kind, seconds, text) => this.alert(kind, seconds, text), log: (m) => this.log(m),
+    });
     this.diag = new DiagCollector(this.capture, makeCpuMeter());
     this.sounds = new SoundPlayer(() => this.config, opts.runner ?? defaultRunner, (m) => this.log(m));
     this.appWatch = new AppWatcher(() => this.config, this.capture, (p) => this.send(cmd.setPage(p)), (m) => this.log(m));
@@ -125,6 +131,7 @@ export class Daemon implements DaemonApi {
       link: this.deck ? this.link : undefined,
       net: this.deck?.net,
       lux: this.deck?.lux,
+      triggers: this.triggers.status(),
     };
   }
 
@@ -313,6 +320,7 @@ export class Daemon implements DaemonApi {
     this.weatherTimer = setInterval(() => void this.pushWeather(), WEATHER_EVERY_MS);
     this.diagTimer = setInterval(() => void this.pushDiag(), DIAG_EVERY_MS);
     await this.refreshSecrets();
+    this.triggers.start();
     this.schedTimer = setInterval(() => void this.applySchedule(), SCHEDULE_EVERY_MS);
     while (!this.stopped) {
       const found = await this.connectLink();
@@ -357,6 +365,7 @@ export class Daemon implements DaemonApi {
   async stop(): Promise<void> {
     this.stopped = true;
     this.widgets.stop();
+    this.triggers.stop();
     this.appWatch.stop();
     if (this.weatherTimer) clearInterval(this.weatherTimer);
     if (this.diagTimer) clearInterval(this.diagTimer);
