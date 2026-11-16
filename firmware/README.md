@@ -140,3 +140,26 @@ Example: `SET_NET:{"ssid":"MyWifi","pass":"secret-pass","host":"smartdeck","toke
 Size: app 1.35 MB of the 3 MB slot (42%), static RAM 19%. Included modules: diagnostics + animated sleep screens, LED alerts,
 BH1750 auto-dim, swipe/hold gestures, WiFi + authenticated TCP host link + OTA + NTP + standalone HA/HTTP, BLE HID keyboard.
 **None of it has run on a real board.** First boot is the first test; keep the USB cable handy for a reflash.
+
+## BLE host slots: one deck, up to 3 machines (`ble_hid.h`, `ble_slots.h`)
+
+- `BLE_HOST:<1|2|3|next>` (reply `BLE_HOST:<n>`, or `BLE_HOST:err:ble_off|bad_slot`) switches the active slot; a button with
+  `"type":"blehost","slot":1|2|3|"next"` does the same **on the deck itself**, even while a host app is connected (never sent as `BTN`).
+  A `BT: <slot name>` pill shows for ~1.5 s. `SET_BLE` accepts `"slots":["Mac","Work PC","iPad"]` (1-3 names, <=12 printable chars,
+  applied to slots 1..k) and `"clear_bonds": true` (all) or `1..3` (that slot). `NET_STATUS` reports `ble_slot` and `ble_slots`
+  (always 3 names; defaults `Host 1..3`).
+- **How the identities work.** Slot 1 keeps the chip's public Bluetooth address, so bonds made before slots existed still work. Slots
+  2 and 3 use a stable static-random address derived from the chip MAC and the slot number (`ble_slot_addr`). NimBLE-Arduino 1.4.3 has
+  no `setOwnAddr()`; on the ESP32 port the host does not pick an address at sync, so after `init()` the module calls the NimBLE host
+  API `ble_hs_id_set_rnd()` and then `setOwnAddrType(BLE_OWN_ADDR_RANDOM)` before advertising starts. Each machine therefore pairs
+  with a different "device" and remembers it separately. Bonds for all slots stay in NVS; the peer that bonded to each slot is
+  recorded in Preferences so a single slot's bond can be cleared.
+- **Pair each machine once**: select its slot, then pair from that machine's Bluetooth settings. After that, switching slots and
+  letting the machine reconnect is automatic.
+- **Limits (honest caveats).** One BLE radio: only ONE host is connected at a time, and switching drops the current one (the stack is
+  stopped and restarted, about a second). Use one machine per slot: only the *last* peer that paired on a slot is recorded for
+  `clear_bonds:<slot>` (`clear_bonds:true` always clears everything, including bonds from older firmware). macOS and iOS can keep
+  auto-reconnecting to a stale identity they still remember; if a machine will not connect, remove "SmartDeck" from its Bluetooth
+  list and pair it again on its slot. A random address is only used on slots 2 and 3, so a host that previously paired with slot
+  1's public address keeps working untouched.
+- Unit test for the pure logic: `g++ -std=c++17 -Wall -iquote JC8048W550/Arduino/smart_deck firmware/tests/ble_slots_test.cpp -o /tmp/t && /tmp/t`
