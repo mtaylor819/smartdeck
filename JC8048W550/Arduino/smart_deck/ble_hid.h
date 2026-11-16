@@ -5,6 +5,10 @@
 #ifndef BLE_HID_H
 #define BLE_HID_H
 
+// Cross-module API used by net_wifi.h (CONTRACT, keep these signatures):
+const char* ble_state_str() { return "off"; }
+String ble_peer_str() { return ""; }
+
 void ble_setup() {}
 void ble_loop() {}
 bool ble_command(const String& c) { return false; }
