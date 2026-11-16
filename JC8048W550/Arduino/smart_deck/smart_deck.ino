@@ -1006,6 +1006,50 @@ void drawWeatherIcon(int x, int y, const uint16_t* icon) {
 
 // --- Function Implementations (Draw and Utilities) ---
 
+// ---- LCARS key shape: small radius on the left, fully rounded right end ----
+#define LCARS_LEFT_R 8
+static const uint16_t LCARS_KEY_COLORS[8] = { LC_ORANGE, LC_LILAC, LC_VIOLET, LC_BLUE, LC_PEACH, LC_SALMON, LC_TAN, LC_GOLD };
+void lcarsFill(int x, int y, int w, int h, uint16_t c) {
+  int R = (w < h ? w : h) / 2;
+  gfx->fillRoundRect(x, y, w, h, R, c);                         // fully rounded pill/circle
+  gfx->fillRoundRect(x, y, w / 2 + 1, h, LCARS_LEFT_R, c);      // left half back to a tight radius
+}
+// Quarter-circle outline centred (cx,cy), pointing in direction (sx,sy) = (+/-1,+/-1).
+void lcarsArc(int cx, int cy, int r, int sx, int sy, uint16_t c) {
+  for (int d = 0; d <= r; d++) {
+    int e = (int)(sqrtf((float)(r * r - d * d)) + 0.5f);
+    gfx->drawPixel(cx + sx * d, cy + sy * e, c);
+    gfx->drawPixel(cx + sx * e, cy + sy * d, c);
+  }
+}
+void lcarsOutline1(int x, int y, int w, int h, uint16_t c) {
+  int R = (w < h ? w : h) / 2, L = LCARS_LEFT_R;
+  if (R < L) L = R;
+  gfx->drawFastHLine(x + L, y, w - R - L, c);
+  gfx->drawFastHLine(x + L, y + h - 1, w - R - L, c);
+  gfx->drawFastVLine(x, y + L, h - 2 * L, c);
+  gfx->drawFastVLine(x + w - 1, y + R, h - 2 * R, c);
+  lcarsArc(x + L, y + L, L, -1, -1, c);
+  lcarsArc(x + L, y + h - 1 - L, L, -1, 1, c);
+  lcarsArc(x + w - 1 - R, y + R, R, 1, -1, c);
+  lcarsArc(x + w - 1 - R, y + h - 1 - R, R, 1, 1, c);
+}
+void lcarsOutline(int x, int y, int w, int h, uint16_t c) { lcarsOutline1(x, y, w, h, c); lcarsOutline1(x + 1, y + 1, w - 2, h - 2, c); }
+// Un-pressed key edge: no visible stroke (the LCARS fill is the shape), so repaint nothing / restore with the fill colour.
+// Default-coloured keys cycle the LCARS palette so the grid reads as LCARS buttons.
+uint16_t lcarsKeyColor(int idx, uint16_t themeColor, bool isDefault) {
+  if (isDefault && (themeColor == C565(0x1A, 0x1A, 0x2E) || themeColor == C565(0x33, 0x33, 0x33))) return LCARS_KEY_COLORS[idx & 7];
+  return themeColor;
+}
+// True when a button uses the (palette-cycled) default colour, so its text should be black like LCARS keys.
+bool lcarsDefaultKey(JsonObject cfg, int idx) {
+  const char* c = cfg["btnColor"];
+  bool isDef = !c || strlen(c) == 0 || strcmp(c, "DEFAULT") == 0;
+  return isDef && lcarsKeyColor(idx, theme_btn_color_rgb565, true) != theme_btn_color_rgb565;
+}
+// Pressed-key highlight sits just outside the key (there is a gap between keys); erase by drawing it in the background colour.
+void lcarsPress(int x, int y, int w, int h, uint16_t c) { lcarsOutline(x - 3, y - 3, w + 6, h + 6, c); }
+
 // *** TJpgDec Output Callback Function *** (Remains the same)
 bool tft_output(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t* bitmap) {
   int16_t jpg_rel_x = jpegInfo.x_offset + x;
@@ -1014,7 +1058,6 @@ bool tft_output(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t* bitmap) 
   int r = jpegInfo.radius;
   int btn_w = jpegInfo.maxWidth;
   int btn_h = jpegInfo.maxHeight;
-  long r_squared = (long)r * r;
 
   for (int16_t py = 0; py < h; py++) {
     for (int16_t px = 0; px < w; px++) {
@@ -1027,21 +1070,16 @@ bool tft_output(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t* bitmap) 
       }
 
       bool draw_pixel = true;
-      if (btn_rel_x < r && btn_rel_y < r) {
-        if (((long)r - btn_rel_x) * ((long)r - btn_rel_x) + ((long)r - btn_rel_y) * ((long)r - btn_rel_y) > r_squared) {
-          draw_pixel = false;
-        }
-      } else if (btn_rel_x >= (btn_w - r) && btn_rel_y < r) {
-        if (((long)btn_rel_x - (btn_w - 1 - r)) * ((long)btn_rel_x - (btn_w - 1 - r)) + ((long)r - btn_rel_y) * ((long)r - btn_rel_y) > r_squared) {
-          draw_pixel = false;
-        }
-      } else if (btn_rel_x < r && btn_rel_y >= (btn_h - r)) {
-        if (((long)r - btn_rel_x) * ((long)r - btn_rel_x) + ((long)btn_rel_y - (btn_h - 1 - r)) * ((long)btn_rel_y - (btn_h - 1 - r)) > r_squared) {
-          draw_pixel = false;
-        }
-      } else if (btn_rel_x >= (btn_w - r) && btn_rel_y >= (btn_h - r)) {
-        if (((long)btn_rel_x - (btn_w - 1 - r)) * ((long)btn_rel_x - (btn_w - 1 - r)) + ((long)btn_rel_y - (btn_h - 1 - r)) * ((long)btn_rel_y - (btn_h - 1 - r)) > r_squared) {
-          draw_pixel = false;
+      {  // LCARS key shape: small radius r on the left, fully rounded (min(w,h)/2) right end
+        int rr_ = (btn_w < btn_h ? btn_w : btn_h) / 2;
+        int cx = -1, cy = -1, rad = 0;
+        if (btn_rel_x < r && btn_rel_y < r) { cx = r; cy = r; rad = r; }
+        else if (btn_rel_x < r && btn_rel_y >= btn_h - r) { cx = r; cy = btn_h - 1 - r; rad = r; }
+        else if (btn_rel_x >= btn_w - rr_ && btn_rel_y < rr_) { cx = btn_w - 1 - rr_; cy = rr_; rad = rr_; }
+        else if (btn_rel_x >= btn_w - rr_ && btn_rel_y >= btn_h - rr_) { cx = btn_w - 1 - rr_; cy = btn_h - 1 - rr_; rad = rr_; }
+        if (rad > 0) {
+          long dx = (long)btn_rel_x - cx, dy = (long)btn_rel_y - cy;
+          if (dx * dx + dy * dy > (long)rad * rad) draw_pixel = false;
         }
       }
 
@@ -1428,8 +1466,7 @@ void checkActiveTimers() {
         Serial.printf("TIMER_DONE:%d:%d\n", current_page, i);
 
         // Visual Effects: Red BG
-        gfx->fillRoundRect(button.x, button.y, button.w, button.h, CORNER_RADIUS, 0xF800);
-        gfx->drawRoundRect(button.x, button.y, button.w, button.h, CORNER_RADIUS, 0xF800);
+        lcarsFill(button.x, button.y, button.w, button.h, 0xF800);
 
         // Draw "00:00" text
         // ... (Metin çizim kodları aynı) ...
@@ -1438,7 +1475,7 @@ void checkActiveTimers() {
         if (final_font_size < 3) final_font_size = 3;
 
         gfx->setTextSize(final_font_size);
-        uint16_t text_color_to_use = theme_text_color_rgb565;
+        uint16_t text_color_to_use = lcarsDefaultKey(button_cfg, i) ? (uint16_t)0x0000 : theme_text_color_rgb565;
         const char* label_color_hex = button_cfg["labelColor"];
         if (label_color_hex) text_color_to_use = hex_to_rgb565(label_color_hex);
         gfx->setTextColor(text_color_to_use);
@@ -1466,10 +1503,9 @@ void checkActiveTimers() {
         uint16_t btn_color_rgb565 = theme_btn_color_rgb565;
         const char* btn_color_hex = button_cfg["btnColor"] | "DEFAULT";
         if (strcmp(btn_color_hex, "DEFAULT") != 0) btn_color_rgb565 = hex_to_rgb565(btn_color_hex);
+        else btn_color_rgb565 = lcarsKeyColor(i, btn_color_rgb565, true);
 
-        gfx->fillRoundRect(button.x, button.y, button.w, button.h, CORNER_RADIUS, btn_color_rgb565);
-        gfx->drawRoundRect(button.x, button.y, button.w, button.h, CORNER_RADIUS, theme_stroke_color_rgb565);
-        gfx->drawRoundRect(button.x + 1, button.y + 1, button.w - 2, button.h - 2, CORNER_RADIUS > 0 ? CORNER_RADIUS - 1 : 0, theme_stroke_color_rgb565);
+        lcarsFill(button.x, button.y, button.w, button.h, btn_color_rgb565);
 
         int label_size_px = button_cfg["labelSize"] | 18;
         int final_font_size = mapFontSize(label_size_px);
@@ -1515,9 +1551,7 @@ void checkActiveTimers() {
       int color_index = (flashDuration / 400) % 5;
       uint16_t flash_color = flash_colors[color_index];
 
-      gfx->fillRoundRect(button.x, button.y, button.w, button.h, CORNER_RADIUS, flash_color);
-      gfx->drawRoundRect(button.x, button.y, button.w, button.h, CORNER_RADIUS, 0xFFFF);
-      gfx->drawRoundRect(button.x + 1, button.y + 1, button.w - 2, button.h - 2, CORNER_RADIUS > 0 ? CORNER_RADIUS - 1 : 0, 0xFFFF);
+      lcarsFill(button.x, button.y, button.w, button.h, flash_color);
 
       int label_size_px = button_cfg["labelSize"] | 18;
       int final_font_size = mapFontSize(label_size_px);
@@ -1608,7 +1642,7 @@ void draw_single_button(int btn_index) {
   // --- 0. SHADOW DRAWING [NEWLY ADDED] ---
   // Before the button itself, we draw a dark colored box 5px to the right and 5px down.
   // This creates a shadow effect under the button.
-  gfx->fillRoundRect(x_pos + 5, y_pos + 5, CELL_W, CELL_H, radius, theme_shadow_color_rgb565);
+  // (LCARS: no drop shadow)
 
   // 1. BACKGROUND COLOR (Fallback)
   uint16_t bg_color = theme_btn_color_rgb565;
@@ -1617,13 +1651,17 @@ void draw_single_button(int btn_index) {
     bg_color = hex_to_rgb565(custom_color);
   }
 
+  bool lcars_dflt = lcarsDefaultKey(button_cfg, btn_index);
+  if (lcars_dflt) bg_color = lcarsKeyColor(btn_index, theme_btn_color_rgb565, true);
+
   if (btn_info.action == "toggle" && current_toggles[btn_index].state) {
     bg_color = current_toggles[btn_index].onColor;
+    lcars_dflt = false;
   }
-  if (live_ov && (live_ov->flags & LIVE_F_BTN)) bg_color = live_ov->btn;  // [live]
+  if (live_ov && (live_ov->flags & LIVE_F_BTN)) { bg_color = live_ov->btn; lcars_dflt = false; }  // [live]
 
-  // Draw background
-  gfx->fillRoundRect(x_pos, y_pos, CELL_W, CELL_H, radius, bg_color);
+  // Draw background (LCARS key shape)
+  lcarsFill(x_pos, y_pos, CELL_W, CELL_H, bg_color);
 
   // 2. ICON / JPEG DRAWING
   String fileToDraw = "";
@@ -1658,7 +1696,7 @@ void draw_single_button(int btn_index) {
           jpegInfo.maxHeight = CELL_H;
           jpegInfo.x_offset = (CELL_W - jpg_w) / 2;
           jpegInfo.y_offset = (CELL_H - jpg_h) / 2;
-          jpegInfo.radius = radius;
+          jpegInfo.radius = LCARS_LEFT_R;
           TJpgDec.drawSdJpg(0, 0, fileToDraw.c_str());
         } else {
           Serial.printf("ERR: JPG size 0 for %s\n", fileToDraw.c_str());
@@ -1673,8 +1711,7 @@ void draw_single_button(int btn_index) {
   }
 
   // 3. Border
-  gfx->drawRoundRect(x_pos, y_pos, CELL_W, CELL_H, radius, theme_stroke_color_rgb565);
-  gfx->drawRoundRect(x_pos + 1, y_pos + 1, CELL_W - 2, CELL_H - 2, radius > 0 ? radius - 1 : 0, theme_stroke_color_rgb565);
+  // (LCARS: no grey border; the coloured key shape is the button)
 
   // 4. Text Drawing
   const char* label_text = button_cfg["label"];
@@ -1747,7 +1784,7 @@ void draw_single_button(int btn_index) {
     }
 
     gfx->setTextSize(final_font_size);
-    uint16_t text_color_to_use = theme_text_color_rgb565;
+    uint16_t text_color_to_use = lcars_dflt ? (uint16_t)0x0000 : theme_text_color_rgb565;
     const char* label_color_hex = button_cfg["labelColor"];
     if (label_color_hex) text_color_to_use = hex_to_rgb565(label_color_hex);
     if (live_ov && (live_ov->flags & LIVE_F_LCOLOR)) text_color_to_use = live_ov->lcolor;  // [live]
@@ -3180,8 +3217,7 @@ void loop() {
       // forced "finger up" below runs the release branch and fires the button under the finger. Also forget gesture state.
       if (last_touched_button_index != -1 && last_touched_button_index < (int)current_buttons.size()) {
         const auto& ob = current_buttons[last_touched_button_index];
-        gfx->drawRoundRect(ob.x, ob.y, ob.w, ob.h, CORNER_RADIUS, theme_stroke_color_rgb565);
-        gfx->drawRoundRect(ob.x + 1, ob.y + 1, ob.w - 2, ob.h - 2, CORNER_RADIUS > 0 ? CORNER_RADIUS - 1 : 0, theme_stroke_color_rgb565);
+        lcarsPress(ob.x, ob.y, ob.w, ob.h, theme_bg_color_rgb565);
       }
       last_touched_button_index = -1;
       was_touched = false;
@@ -3239,13 +3275,11 @@ void loop() {
         // Draw old button (if any) as released
         if (last_touched_button_index != -1) {
           const auto& old_btn = current_buttons[last_touched_button_index];
-          gfx->drawRoundRect(old_btn.x, old_btn.y, old_btn.w, old_btn.h, radius, theme_stroke_color_rgb565);
-          gfx->drawRoundRect(old_btn.x + 1, old_btn.y + 1, old_btn.w - 2, old_btn.h - 2, radius > 0 ? radius - 1 : 0, theme_stroke_color_rgb565);
+          lcarsPress(old_btn.x, old_btn.y, old_btn.w, old_btn.h, theme_bg_color_rgb565);
         }
         // Draw new button with pressed effect
         const auto& current_btn = current_buttons[current_touched_button_index];
-        gfx->drawRoundRect(current_btn.x, current_btn.y, current_btn.w, current_btn.h, radius, theme_click_stroke_color_rgb565);
-        gfx->drawRoundRect(current_btn.x + 1, current_btn.y + 1, current_btn.w - 2, current_btn.h - 2, radius > 0 ? radius - 1 : 0, theme_click_stroke_color_rgb565);
+        lcarsPress(current_btn.x, current_btn.y, current_btn.w, current_btn.h, theme_click_stroke_color_rgb565);
       }
       last_touched_button_index = current_touched_button_index;
     }
@@ -3356,8 +3390,7 @@ void loop() {
         // Clear button press effect (restore normal border)
         // Skip if page transition (goto) occurred
         if (released_btn.action != "goto" && released_btn.action != "toggle" && current_timers[last_touched_button_index].state == TIMER_INACTIVE) {
-          gfx->drawRoundRect(released_btn.x, released_btn.y, released_btn.w, released_btn.h, radius, theme_stroke_color_rgb565);
-          gfx->drawRoundRect(released_btn.x + 1, released_btn.y + 1, released_btn.w - 2, released_btn.h - 2, radius > 0 ? radius - 1 : 0, theme_stroke_color_rgb565);
+          lcarsPress(released_btn.x, released_btn.y, released_btn.w, released_btn.h, theme_bg_color_rgb565);
         }
 
         last_touched_button_index = -1;

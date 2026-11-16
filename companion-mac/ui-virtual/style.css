@@ -10,10 +10,13 @@
 * { box-sizing: border-box; }
 html, body { background: var(--bg); margin: 0; }
 body { color: var(--text); font: 15px/1.4 var(--font); letter-spacing: .02em; }
-button { font: inherit; background: var(--violet); color: #000; border: 0; border-radius: 16px; padding: 0 14px; height: 30px; cursor: pointer; text-transform: uppercase; letter-spacing: .08em; font-weight: 600; font-size: 12px; }
-button:hover:not(:disabled) { filter: brightness(1.15); }
-button:disabled { opacity: .4; cursor: default; }
-#ackBtn { background: var(--danger); }
+button { font: inherit; background: var(--violet); color: #000; border: 0; border-radius: 18px; padding: 0 16px; height: 32px; cursor: pointer; text-transform: uppercase; letter-spacing: .1em; font-weight: 600; font-size: 13px; white-space: nowrap; }
+button:hover:not(:disabled) { filter: brightness(1.18); }
+button:active:not(:disabled) { filter: brightness(.9); }
+button:disabled { opacity: .35; cursor: default; }
+button.primary { background: var(--orange); }
+button.ghost { background: var(--blue); }
+button.danger, #ackBtn { background: var(--salmon); }
 [hidden] { display: none !important; }
 
 #frame { display: grid; grid-template-columns: var(--rail) minmax(0, 1fr); grid-template-rows: var(--elbow-h) 1fr auto; gap: var(--gap); min-height: 100vh; padding: 10px 14px 10px 10px; }

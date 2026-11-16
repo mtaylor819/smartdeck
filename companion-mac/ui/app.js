@@ -321,9 +321,13 @@ function colorInput(obj, key, fallbackHex, onChange, clearable = true) {
 }
 
 // ---------- grid ----------
-function cellStyle(b) {
+const LCARS_KEYS = ['#ff9900', '#cc99cc', '#9999cc', '#99ccff', '#ff9966', '#cc6666', '#ffcc99', '#ffcc66'];
+function cellStyle(b, i = 0) {
   const t = state.cfg.theme;
-  return { background: hexIn(b?.btnColor, '#' + t.btn_color), color: hexIn(b?.labelColor, '#' + t.text_color) };
+  // No explicit colour set: cycle the LCARS palette instead of the dark default so keys read as LCARS buttons.
+  const dflt = !b?.btnColor && /^(1a1a2e|333333)$/i.test(t.btn_color);
+  return { background: dflt ? LCARS_KEYS[i % LCARS_KEYS.length] : hexIn(b?.btnColor, '#' + t.btn_color),
+           color: hexIn(b?.labelColor, dflt ? '#000000' : '#' + t.text_color) };
 }
 
 function drawGrid() {
@@ -337,7 +341,7 @@ function drawGrid() {
     const b = btns[i];
     const cell = h('div', { class: 'cell' + (b ? '' : ' empty') + (state.sel === i ? ' selected' : ''), draggable: !!b });
     if (b) {
-      Object.assign(cell.style, cellStyle(b));
+      Object.assign(cell.style, cellStyle(b, i));
       if (b.icon) cell.append(h('img', { src: '/icons/' + encodeURIComponent(b.icon), alt: '' }));
       cell.append(h('span', { class: 'atype' }, b.action?.type || 'none'));
       if (b.widget) cell.append(h('span', { class: 'badge' }, '● ' + b.widget.source));

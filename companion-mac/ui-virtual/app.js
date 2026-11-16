@@ -36,6 +36,14 @@ function rr(c, x, y, w, h, r) {
   c.beginPath(); c.moveTo(x + r, y); c.arcTo(x + w, y, x + w, y + h, r); c.arcTo(x + w, y + h, x, y + h, r);
   c.arcTo(x, y + h, x, y, r); c.arcTo(x, y, x + w, y, r); c.closePath();
 }
+/** LCARS key shape: small radius on the left, fully rounded right end. */
+function lcarsPath(c, x, y, w, h) {
+  const a = 8, b = Math.min(w, h) * 0.5;
+  c.beginPath(); c.moveTo(x + a, y); c.lineTo(x + w - b, y); c.arcTo(x + w, y, x + w, y + b, b); c.lineTo(x + w, y + h - b);
+  c.arcTo(x + w, y + h, x + w - b, y + h, b); c.lineTo(x + a, y + h); c.arcTo(x, y + h, x, y + h - a, a);
+  c.lineTo(x, y + a); c.arcTo(x, y, x + a, y, a); c.closePath();
+}
+const LCARS_KEYS = ['#ff9900', '#cc99cc', '#9999cc', '#99ccff', '#ff9966', '#cc6666', '#ffcc99', '#ffcc66'];
 function fillRR(c, x, y, w, h, r, color) { rr(c, x, y, w, h, r); c.fillStyle = color; c.fill(); }
 function rect(c, x, y, w, h, color) { c.fillStyle = color; c.fillRect(x, y, w, h); }
 /** Text in the firmware's built-in font: cell is 6x8 px times `size`, top-left anchored. */
@@ -85,20 +93,19 @@ function drawButton(c, s, cell, b0, isPressed) {
   const stroke = isPressed ? '#ffffff' : hex(th.stroke_color, '#555555');
   const key = `${s.page}:${cell.i}`;
   const toggleOn = b.type === 'toggle' && (s.toggles[key] ?? true);
-  const fill = toggleOn ? hex(b.toggleData && b.toggleData.onColor, '#00ff00') : btnCol;
+  const dflt = !b.btnColor && /^(1a1a2e|333333)$/i.test(th.btn_color || '');
+  const fill = toggleOn ? hex(b.toggleData && b.toggleData.onColor, '#00ff00') : (dflt ? LCARS_KEYS[cell.i % LCARS_KEYS.length] : btnCol);
 
-  fillRR(c, cell.x + SHADOW, cell.y + SHADOW, cell.w, cell.h, RADIUS, hex(th.shadow_color, '#000000'));
-  fillRR(c, cell.x, cell.y, cell.w, cell.h, RADIUS, fill);
+  lcarsPath(c, cell.x, cell.y, cell.w, cell.h); c.fillStyle = fill; c.fill();
 
   let iconName = b.icon;
   if (b.type === 'toggle' && b.toggleData) iconName = (toggleOn ? b.toggleData.iconOn : b.toggleData.iconOff) || iconName;
   const im = icon(iconName);
   if (im) {
-    c.save(); rr(c, cell.x, cell.y, cell.w, cell.h, RADIUS); c.clip();
+    c.save(); lcarsPath(c, cell.x, cell.y, cell.w, cell.h); c.clip();
     c.drawImage(im, cell.x, cell.y, cell.w, cell.h); c.restore();
   }
-  c.lineWidth = 2; c.strokeStyle = stroke;
-  rr(c, cell.x + 1, cell.y + 1, cell.w - 2, cell.h - 2, RADIUS); c.stroke();
+  if (isPressed) { c.lineWidth = 2; c.strokeStyle = hex(th.click_stroke_color, '#00b4ff'); lcarsPath(c, cell.x - 3, cell.y - 3, cell.w + 6, cell.h + 6); c.stroke(); }  // firmware: outline just outside the key
 
   // label / counter / timer text
   let label = b.label || '';
