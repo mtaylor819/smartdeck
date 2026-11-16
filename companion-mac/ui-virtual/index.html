@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="csrf-token" content="__CSRF_TOKEN__">
+  <title>SmartDeck Virtual Deck</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <div id="frame">
+    <div class="elbow"></div>
+    <header id="topbar">
+      <div class="brand">Virtual Deck <span class="sub">Hardware Emulator</span></div>
+      <div id="hostChip" class="chip off">HOST: —</div>
+      <div class="spacer"></div>
+      <div id="linkChip" class="chip">LINK: —</div>
+    </header>
+
+    <aside id="rail" aria-hidden="true">
+      <div class="seg c-peach"><span>01</span></div>
+      <div class="seg c-violet tall"><span>800</span></div>
+      <div class="seg c-blue"><span>480</span></div>
+      <div class="seg c-lilac grow"></div>
+    </aside>
+
+    <main>
+      <div class="layout">
+        <section id="deckCol">
+          <div id="screenWrap"><canvas id="screen" width="800" height="480" aria-label="Deck screen"></canvas></div>
+          <p class="hint">Click a button · hold for long-press · drag left/right to swipe pages · click anywhere to wake or acknowledge an alert</p>
+        </section>
+
+        <section id="sideCol">
+          <div class="panel">
+            <h3>Knob &amp; LED ring</h3>
+            <canvas id="knob" width="220" height="220" aria-label="Rotary encoder with LED ring"></canvas>
+            <p class="hint">Drag the dial or scroll over it</p>
+          </div>
+
+          <div class="panel" id="statusPanel">
+            <h3>Status</h3>
+            <dl id="status"></dl>
+            <div class="row">
+              <button id="wakeBtn">Wake</button>
+              <button id="sleepBtn">Sleep now</button>
+              <button id="bleBtn">Simulate BLE connect</button>
+              <button id="ackBtn" hidden>Acknowledge alert</button>
+            </div>
+            <label class="slider" id="luxRow">Ambient light <output id="luxOut">150 lux</output>
+              <input id="lux" type="range" min="0" max="1000" value="150">
+            </label>
+          </div>
+
+          <div class="panel">
+            <h3>Deck log</h3>
+            <pre id="log"></pre>
+          </div>
+        </section>
+      </div>
+    </main>
+
+    <div class="elbow bottom"></div>
+    <footer id="foot"><span id="footLeft">Emulating Guition JC8048W550 · 800×480</span><span class="spacer"></span><span id="footRight"></span></footer>
+  </div>
+  <script src="/app.js" defer></script>
+</body>
+</html>
