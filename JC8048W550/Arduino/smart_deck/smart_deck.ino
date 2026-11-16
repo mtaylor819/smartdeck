@@ -2177,7 +2177,10 @@ void loop() {
     strip.clear();
 
     // B) MODE CHECK: SLEEP OR ACTIVE?
-    if (is_sleeping) {
+    // [led-alert hook] an active alert (led_alert.h) paints the ring in both awake and dim-sleep states.
+    if (alert_render_ring()) {
+      // painted by the alert; strip.show() below
+    } else if (is_sleeping) {
       // --- BREATHING MODE ---
       // Calculate brightness using sine wave (smooth cyclic transition)
       float breath = (exp(sin(millis() / 2000.0 * PI)) - 0.36787944) * 108.0;
@@ -3038,6 +3041,12 @@ void loop() {
     // If less than 50ms since last valid touch, assume finger still on screen.
     // Bu, kısa süreli sinyal kopmalarını (bouncing) yutar.
     bool is_touched_now = (currentMillis - last_valid_touch_time < 50);
+
+    // [led-alert hook] while an alert is up, a touch acknowledges it and is swallowed until the finger lifts.
+    if (alert_touch_ack(is_touched_now)) {
+      is_touched_now = false;
+      last_valid_touch_time = 0;
+    }
 
     // Uyku Modundan Çıkış
     if (is_touched_now) {
