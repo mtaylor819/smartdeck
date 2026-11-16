@@ -30,9 +30,13 @@ class HostIOClass : public Stream {
     flushTcp();
     tcp_ = c;
     olen_ = 0;
+    stall_ = 0;
     in_ = &usb_;
   }
   bool hasTcp() const { return tcp_ != nullptr; }
+  // [v4] True once the TCP peer has failed to drain our output many times in a row (stalled/vanished client): net_wifi.h drops
+  // the link so every later output line no longer costs up to 5 ms of loop() time.
+  bool tcpStalled() const { return stall_ >= 20; }
   void useTcpInput(bool on) { in_ = (on && tcp_) ? static_cast<Stream*>(tcp_) : static_cast<Stream*>(&usb_); }
 
   // Push any buffered output to the TCP client without blocking the main loop (a full socket drops data).
@@ -48,6 +52,7 @@ class HostIOClass : public Stream {
       if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) { retries++; delay(1); continue; }
       break;  // error / closed: drop (the link tick notices the dead socket)
     }
+    if (off < olen_) { if (stall_ < 255) stall_++; } else stall_ = 0;  // [v4] consecutive undrained flushes
     olen_ = 0;
   }
 
@@ -88,6 +93,7 @@ class HostIOClass : public Stream {
   Stream* in_ = &usb_;
   uint8_t obuf_[512];
   size_t olen_ = 0;
+  uint8_t stall_ = 0;
 };
 
 static HostIOClass HostIOStream;
