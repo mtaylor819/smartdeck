@@ -141,3 +141,21 @@ test('TcpTransport: the token is never sent, only an HMAC of the nonce; malforme
   await new Promise<void>((r) => bad.listen(0, '127.0.0.1', () => r()));
   try { await assert.rejects(TcpTransport.connect(`127.0.0.1:${(bad.address() as net.AddressInfo).port}`, 'secret-token-xyz'), /unexpected reply/); } finally { bad.close(); }
 });
+
+import { clientProof, deckProof, otaProof, sha256Hex, ctEqualHex } from '../src/linkauth.js';
+
+test('link auth: known-answer vectors shared with the firmware (host test net_auth_test.cpp, RFC 4231-checked HMAC)', () => {
+  const token = 'tok-12345678', nonce = '00112233445566778899aabbccddeeff';
+  assert.equal(clientProof(token, nonce), '4c7033181e95f3379b8bd0d8f375a64b211ddcdc8256305b290ac5a294a6c9d0');
+  assert.equal(deckProof(token, nonce), 'a60e5fcc4a501f9cf3e47f0fca87d0a7dcd839eb09d8ce08f09ce582d42ea72a');
+  const empty = sha256Hex(Buffer.alloc(0));
+  assert.equal(empty, 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855');
+  assert.equal(otaProof(token, nonce, empty), '9eafd1d570e38a8b6d5360dd4ab90a4e1ea83126274986af0aebe94fb2ac98c4');
+});
+
+test('ctEqualHex: equal, different, different length, empty', () => {
+  assert.equal(ctEqualHex('abc', 'abc'), true);
+  assert.equal(ctEqualHex('abc', 'abd'), false);
+  assert.equal(ctEqualHex('abc', 'abcd'), false);
+  assert.equal(ctEqualHex('', ''), true);
+});
