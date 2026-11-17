@@ -117,6 +117,8 @@ export const defaultConfig = (): Config => ({
   grid: { cols: 4, rows: 3 },
   theme: { bg_color: '0f0f0f', btn_color: '1a1a2e', text_color: 'ffffff', stroke_color: '4a4a6a', shadow_color: '000000' },
   brightness: 80,
+  // Default link: the software virtual deck (`smartdeck-mac virtual`, TCP 7778). USB decks are still preferred when present.
+  device: { address: '127.0.0.1', token: 'virtual-deck' },
   knob: {
     cw: { type: 'media', key: 'volume_up' },
     ccw: { type: 'media', key: 'volume_down' },
