@@ -1035,10 +1035,18 @@ static uint16_t lcBlend(uint16_t fg, uint16_t bg, uint8_t a) {  // a = 0..15
   uint32_t r = (fr * a + br * (15 - a)) / 15, g = (fgc * a + bgc * (15 - a)) / 15, b = (fb * a + bb * (15 - a)) / 15;
   return (uint16_t)((r << 11) | (g << 5) | b);
 }
+static uint16_t lcLerp(uint16_t a, uint16_t b, int t) {  // t: 0..256
+  if (t <= 0) return a;
+  if (t >= 256) return b;
+  int ar = (a >> 11) & 31, ag = (a >> 5) & 63, ab = a & 31, br = (b >> 11) & 31, bg_ = (b >> 5) & 63, bb = b & 31;
+  return (uint16_t)(((ar + ((br - ar) * t >> 8)) << 11) | ((ag + ((bg_ - ag) * t >> 8)) << 5) | (ab + ((bb - ab) * t >> 8)));
+}
 // Corner of radius r whose circle centre is at the inner corner; (ox,oy) is the pixel next to the centre, (sx,sy) points outward.
-static void lcCarve(int ox, int oy, int sx, int sy, int r, uint16_t col, uint16_t bg) {
+// Optional vertical gradient: colour goes colA -> colB over rows gy0 .. gy0+gh.
+static void lcCarve(int ox, int oy, int sx, int sy, int r, uint16_t colA, uint16_t bg, uint16_t colB = 0, int gy0 = 0, int gh = 0) {
   float rf = (float)r;
   for (int j = 0; j < r; j++) {
+    uint16_t col = gh > 0 ? lcLerp(colA, colB, ((oy + sy * j - gy0) * 256) / gh) : colA;
     float dy = j + 0.5f;
     float of = (rf + 0.5f) * (rf + 0.5f) - dy * dy;
     float ff = (rf - 0.5f) * (rf - 0.5f) - dy * dy;
@@ -1070,6 +1078,16 @@ static void lcShape(int x, int y, int w, int h, int rTL, int rTR, int rBR, int r
   if (rBL) lcCarve(x + rBL - 1, y + h - rBL, -1, 1, rBL, col, bg);
 }
 static void lcRRect(int x, int y, int w, int h, int r, uint16_t col, uint16_t bg) { lcShape(x, y, w, h, r, r, r, r, col, bg); }
+// Same, filled with a top-to-bottom gradient (metallic LCARS bands).
+static void lcShapeG(int x, int y, int w, int h, int rTL, int rTR, int rBR, int rBL, uint16_t cTop, uint16_t cBot, uint16_t bg) {
+  int m = (w < h ? w : h) / 2;
+  if (rTL > m) rTL = m; if (rTR > m) rTR = m; if (rBR > m) rBR = m; if (rBL > m) rBL = m;
+  for (int j = 0; j < h; j++) gfx->fillRect(x, y + j, w, 1, lcLerp(cTop, cBot, j * 256 / (h > 1 ? h - 1 : 1)));
+  if (rTL) lcCarve(x + rTL - 1, y + rTL - 1, -1, -1, rTL, cTop, bg, cBot, y, h);
+  if (rTR) lcCarve(x + w - rTR, y + rTR - 1, 1, -1, rTR, cTop, bg, cBot, y, h);
+  if (rBR) lcCarve(x + w - rBR, y + h - rBR, 1, 1, rBR, cTop, bg, cBot, y, h);
+  if (rBL) lcCarve(x + rBL - 1, y + h - rBL, -1, 1, rBL, cTop, bg, cBot, y, h);
+}
 // Pill: both ends rounded (rl/rr choose which ends).
 static void lcPill(int x, int y, int w, int h, uint16_t col, uint16_t bg, bool rl = true, bool rr = true) {
   int r = h / 2;
@@ -1182,10 +1200,18 @@ static void lcUpper(char* dst, size_t n, const char* src, size_t maxChars) {
   dst[i] = 0;
 }
 
+// Metallic LCARS gradient (light top -> darker bottom), shared by the top bars, the bottom-left band and the foot bar.
+static inline uint16_t lcMetalTop() { return lcBlend(0xFFFF, LC_BLUE, 8); }
+static inline uint16_t lcMetalBot() { return lcBlend(LC_VIOLET, 0, 12); }
+// Repaint the gradient behind a region of a bar whose gradient spans rows gy0 .. gy0+gh (used when text on the bar changes).
+static void lcMetalClear(int x, int y, int w, int h, int gy0, int gh) {
+  for (int j = 0; j < h; j++) gfx->fillRect(x, y + j, w, 1, lcLerp(lcMetalTop(), lcMetalBot(), (y + j - gy0) * 256 / (gh > 1 ? gh - 1 : 1)));
+}
+
 // ---- LCARS page frame, mirroring the virtual deck (companion-mac/ui-virtual/style.css) ----
 // Top: orange elbow (concave inner curve) -> stub -> brand pill -> tan line -> dark chips. Left: gapped colour rail.
 // Bottom: violet elbow + foot bar. The key grid lives in x >= FRAME_RAIL_W, y 50..440 (see draw_page).
-#define FRAME_RAIL_W 124   // rail (110) + gap; keys are laid out in screenWidth - FRAME_RAIL_W
+#define FRAME_RAIL_W 172   // left data column (to x=160) + gap; keys are laid out in screenWidth - FRAME_RAIL_W
 #define FRAME_FOOT_Y 446   // foot bar top (34 px tall, to the bottom edge)
 
 void lcarsFrame(const char* title, const char* page_name, int page_index, int page_count) {
@@ -1195,19 +1221,19 @@ void lcarsFrame(const char* title, const char* page_name, int page_index, int pa
   const LcFont& small = lcFontPx(19);
 
   uint16_t bg = theme_bg_color_rgb565;
-  // --- Elbow: 110 x 84, top-left radius 70, plus the concave fillet under the top arm ---
-  lcShape(0, 0, 110, 84, 70, 0, 0, 0, LC_ORANGE, bg);
-  lcFillet(109, 40, 34, LC_ORANGE, bg);
+  // --- Metallic gradient bands, top-left and bottom-left (the data-row column sits between them) ---
+  uint16_t gl = lcMetalTop(), gd = lcMetalBot();  // light top -> darker bottom (dark text stays readable)
+  lcShapeG(12, 4, 154, 36, 36, 0, 0, 0, gl, gd, bg);
+  lcShapeG(12, FRAME_FOOT_Y, 154, 34, 0, 0, 0, 34, gl, gd, bg);
 
-  // --- Top arm: stub, brand pill, tan line, chips ---
-  gfx->fillRect(116, 0, 34, 40, LC_ORANGE);  // stub
+  // --- Top arm: brand bar, line, chips; the bar and the line use the same metallic gradient and top edge as the left band ---
   char brand[40];
   lcUpper(brand, sizeof(brand), title, 24);
   const LcFont* bf = &big;
-  if (lcW(big, brand) + 36 > 400) bf = &small;
+  if (lcW(big, brand) + 36 > 360) bf = &small;
   int bw = lcW(*bf, brand) + 36;
-  lcShape(146, 0, bw, 40, 0, 20, 20, 0, LC_ORANGE, bg);
-  lcPrintC(*bf, 146 + 18, 20, brand, BLACK, LC_ORANGE);
+  lcShapeG(172, 4, bw, 36, 0, 18, 18, 0, gl, gd, bg);
+  lcPrintC(*bf, 172 + 18, 22, brand, BLACK, lcLerp(gl, gd, 140));
 
   // Chips, right to left: page number, then page name
   char pg[16];
@@ -1216,31 +1242,21 @@ void lcarsFrame(const char* title, const char* page_name, int page_index, int pa
   lcUpper(pn, sizeof(pn), page_name, 14);
   int c1w = lcW(small, pg) + 32, c2w = lcW(small, pn) + 32;
   int x1 = edge - c1w;
-  lcRRect(x1, 0, c1w, 40, 20, LC_CHIP, bg);
-  lcPrintC(small, x1 + 16, 20, pg, LC_BLUE, LC_CHIP);
+  lcRRect(x1, 4, c1w, 36, 18, LC_CHIP, bg);
+  lcPrintC(small, x1 + 16, 22, pg, LC_BLUE, LC_CHIP);
   int x2 = x1 - 6 - c2w;
-  if (pn[0] && x2 > 146 + bw + 6 + 20) {
-    lcRRect(x2, 0, c2w, 40, 20, LC_CHIP, bg);
-    lcPrintC(small, x2 + 16, 20, pn, LC_TAN, LC_CHIP);
+  if (pn[0] && x2 > 172 + bw + 6 + 20) {
+    lcRRect(x2, 4, c2w, 36, 18, LC_CHIP, bg);
+    lcPrintC(small, x2 + 16, 22, pn, LC_TAN, LC_CHIP);
   } else {
     x2 = x1;
   }
   // Tan line filling the gap between brand and chips
-  int lx = 146 + bw + 10, lw = x2 - 10 - lx;
-  if (lw > 10) lcRRect(lx, 14, lw, 12, 6, LC_TAN, bg);
+  int lx = 172 + bw + 10, lw = x2 - 10 - lx;
+  if (lw > 10) lcShapeG(lx, 16, lw, 12, 6, 6, 6, 6, gl, gd, bg);  // vertically centred on the 4..40 bars
 
-  // --- Rail: gapped segments with right-aligned numbers ---
-  char num[8];
-  gfx->fillRect(0, 90, 110, 44, LC_PEACH);
-  snprintf(num, sizeof(num), "%02d", page_index + 1);
-  lcPrintC(small, 110 - 12, 90 + 44 - 6 - small.cap / 2, num, BLACK, LC_PEACH, true);
-  gfx->fillRect(0, 140, 110, 90, LC_VIOLET);
-  gfx->fillRect(0, 236, 110, 44, LC_BLUE);
-  gfx->fillRect(0, 286, 110, 154, LC_LILAC);
-
-  // --- Foot: violet elbow (rounded bottom-left, radius 34) + bar (rounded right end) ---
-  lcShape(0, FRAME_FOOT_Y, 110, 34, 0, 0, 0, 34, LC_VIOLET, bg);
-  lcShape(116, FRAME_FOOT_Y, edge - 116, 34, 0, 17, 17, 0, LC_VIOLET, bg);
+  // --- Foot bar (rounded right end); the live data rows, status text and clock are drawn by dash_init ---
+  lcShapeG(172, FRAME_FOOT_Y, edge - 172, 34, 0, 17, 17, 0, gl, gd, bg);
   dash_init(page_name, page_index, page_count);  // rail numbers/lights, foot text, status, clock (animated in dash_tick)
 }
 

@@ -78,6 +78,8 @@ static inline uint16_t op_scale(uint16_t c, int s) {  // s: 0..256
 // ---- odometer fields ----
 struct OpField {
   int16_t x, y, w;
+  uint16_t bg2;      // optional vertical gradient bg -> bg2 over rows gy0 .. gy0+gh (gh == 0: flat)
+  int16_t gy0, gh;
   const LcFont* f;
   char tpl[26], tgt[26], cur[26];
   uint8_t roll[26], n;
@@ -87,9 +89,17 @@ struct OpField {
 static char opf_rand(char t) { return t == '#' ? (char)('0' + random(0, 10)) : (char)('A' + random(0, 26)); }
 static void opf_draw(OpField& o) {
   int x0 = o.right ? o.x - o.w : o.x;
-  gfx->fillRect(x0 - 1, o.y - o.f->cap - 2, o.w + 2, o.f->cap + 5, o.bg);
-  lcDraw(*o.f, o.right ? o.x - lcW(*o.f, o.cur) : o.x, o.y, o.cur, o.fg, o.bg);
+  int y0 = o.y - o.f->cap - 2, h = o.f->cap + 5;
+  uint16_t tbg = o.bg;
+  if (o.gh > 0) {
+    for (int j = 0; j < h; j++) gfx->fillRect(x0 - 1, y0 + j, o.w + 2, 1, lcLerp(o.bg, o.bg2, (y0 + j - o.gy0) * 256 / (o.gh > 1 ? o.gh - 1 : 1)));
+    tbg = lcLerp(o.bg, o.bg2, 128);
+  } else {
+    gfx->fillRect(x0 - 1, y0, o.w + 2, h, o.bg);
+  }
+  lcDraw(*o.f, o.right ? o.x - lcW(*o.f, o.cur) : o.x, o.y, o.cur, o.fg, tbg);
 }
+static void opf_set_grad(OpField& o, uint16_t c2, int gy0, int gh) { o.bg2 = c2; o.gy0 = (int16_t)gy0; o.gh = (int16_t)gh; opf_draw(o); }
 // New random target; changed characters roll for a few frames before settling.
 static void opf_retarget(OpField& o, bool animate) {
   for (int i = 0; i < o.n; i++) {
@@ -610,22 +620,40 @@ static void warp_frame(uint32_t now, float dt) {
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
-// DASHBOARD (key page) live LCARS elements: rolling numbers in the rail and foot bar, blinking status lights, cycling status text and a
-// clock. Everything lives in the rail (x<110) and foot bar (y>=446) so alert banners / BT toasts in the header strip and the keys are
-// never touched. dash_init() is called by lcarsFrame() each time the page is drawn; dash_tick() runs from anim_loop().
+// DASHBOARD (key page) live LCARS elements: a column of data rows on the left (rolling numbers, changing names, blinking squares),
+// plus a status line, rolling readout and clock in the foot bar. Everything lives left of the keys (x < 166) and in the foot bar
+// (y >= 446), so alert banners / BT toasts in the header strip and the keys are never touched. dash_init() is called by lcarsFrame()
+// each time the page is drawn; dash_tick() runs from anim_loop().
 // ---------------------------------------------------------------------------------------------------------------------
+#define DR_N 19
+#define DR_X 12
+#define DR_Y0 46
+#define DR_H 15
+struct DrRow { OpField num; int16_t y; uint16_t col; uint16_t period; uint8_t name; uint8_t sq; };
+static DrRow dr[DR_N];
 static bool dh_on = false;
-static OpField dh_rail[3];     // violet (top, bottom) and blue segment readouts
 static OpField dh_odo;         // foot bar readout
-static uint8_t dh_light[4];
 static uint8_t dh_stat_i = 0;
 static int dh_clk_h = -1, dh_clk_m = -1;
 static bool dh_clk_ok = false;
-static uint32_t dh_t_roll, dh_t_stat;
+static uint32_t dh_t_roll, dh_t_stat, dh_t_name;
 static const char* const DH_STAT[6] = { "ALL SYSTEMS GREEN", "COMMS ONLINE", "POWER NOMINAL", "SENSORS ACTIVE", "SHIELDS UP", "NAV LOCKED" };
-static const int16_t DH_LIGHT_Y[4] = { 300, 340, 380, 414 };
-static const uint16_t DH_PERIOD[4] = { 700, 1100, 1700, 2600 };
+static const char* const DR_NAMES[24] = { "VEGA SECTOR", "HELM CONTROL", "SUBSPACE LINK", "ION STORM 9", "TACTICAL GRID", "SENSOR ARRAY", "FLUX COIL 8",
+  "TRANSPORTER 3", "LIFE SUPPORT", "COMM RELAY 5", "CARGO BAY 1", "NEBULA SURVEY", "ANTIMATTER", "DEFLECTOR", "WARP CORE", "HOLODECK 2",
+  "SHIELD GRID", "NAV COMPUTER", "PLASMA FLOW", "DILITHIUM", "IMPULSE 4", "GAMMA QUAD", "ASTRO LAB", "DEEP SPACE 4" };
 #define DH_FOOT_Y 446
+#define DH_MID lcLerp(lcMetalTop(), lcMetalBot(), 128)   // text on the foot bar blends against the mid-bar gradient colour
+
+static void dr_name_draw(DrRow& r) {
+  const LcFont& f = lcFontPx(14);
+  gfx->fillRect(DR_X + 56, r.y, 78, DR_H, r.col);
+  lcRRect(DR_X + 56, r.y, 78, DR_H, 3, r.col, theme_bg_color_rgb565);
+  lcDraw(f, DR_X + 60, r.y + 8 + f.cap / 2, DR_NAMES[r.name % 24], BLACK, r.col);
+}
+static void dr_square_draw(DrRow& r, bool on) {
+  lcRRect(DR_X + 138, r.y, 12, DR_H, 2, on ? LC_TAN : op_scale(r.col, 90), theme_bg_color_rgb565);
+  r.sq = on ? 1 : 0;
+}
 
 static void dh_clock() {
   const LcFont& f = lcFontPx(19);
@@ -633,37 +661,48 @@ static void dh_clock() {
   if (clock_initialized) snprintf(b, sizeof(b), "%02d:%02d", current_hour, current_minute);
   else snprintf(b, sizeof(b), "--:--");
   int edge = (int)screenWidth - 6;
-  gfx->fillRect(edge - 20 - 64, DH_FOOT_Y + 4, 66, 26, LC_VIOLET);
-  lcPrintC(f, edge - 20, DH_FOOT_Y + 17, b, BLACK, LC_VIOLET, true);
+  lcMetalClear(edge - 20 - 64, DH_FOOT_Y + 4, 66, 26, DH_FOOT_Y, 34);
+  lcPrintC(f, edge - 20, DH_FOOT_Y + 17, b, BLACK, DH_MID, true);
   dh_clk_h = current_hour; dh_clk_m = current_minute; dh_clk_ok = clock_initialized;
 }
 static void dh_status() {
   const LcFont& f = lcFontPx(19);
-  gfx->fillRect(396, DH_FOOT_Y + 4, 190, 26, LC_VIOLET);
-  lcPrintC(f, 400, DH_FOOT_Y + 17, DH_STAT[dh_stat_i % 6], BLACK, LC_VIOLET);
+  lcMetalClear(396, DH_FOOT_Y + 4, 190, 26, DH_FOOT_Y, 34);
+  lcPrintC(f, 400, DH_FOOT_Y + 17, DH_STAT[dh_stat_i % 6], BLACK, DH_MID);
 }
 
 void dash_init(const char* page_name, int page_index, int page_count) {
   (void)page_index; (void)page_count;
   const LcFont& f = lcFontPx(19);
+  const LcFont& sm = lcFontPx(14);
   int edge = (int)screenWidth - 6;
+  uint16_t bg = theme_bg_color_rgb565;
   // foot bar: "SMARTDECK  <PAGE NAME>" at the left
   char fl[48];
   snprintf(fl, sizeof(fl), "SMARTDECK  ");
   lcUpper(fl + strlen(fl), sizeof(fl) - strlen(fl), page_name, 20);
-  lcPrintC(f, 140, DH_FOOT_Y + 17, fl, BLACK, LC_VIOLET);
+  lcPrintC(f, 196, DH_FOOT_Y + 17, fl, BLACK, DH_MID);
   dh_stat_i = (uint8_t)random(0, 6);
   dh_status();
-  opf_init(dh_odo, edge - 96, DH_FOOT_Y + 17 + f.cap / 2, f, "47###.##", BLACK, LC_VIOLET, true);
+  opf_init(dh_odo, edge - 96, DH_FOOT_Y + 17 + f.cap / 2, f, "47###.##", BLACK, lcMetalTop(), true);
+  opf_set_grad(dh_odo, lcMetalBot(), DH_FOOT_Y, 34);
   dh_clock();
-  // rail readouts (black on the segment colours)
-  opf_init(dh_rail[0], 98, 140 + 22 + f.cap / 2, f, "###", BLACK, LC_VIOLET, true);
-  opf_init(dh_rail[1], 98, 140 + 90 - 6, f, "####", BLACK, LC_VIOLET, true);
-  opf_init(dh_rail[2], 98, 236 + 44 - 6, f, "##.#", BLACK, LC_BLUE, true);
-  // status lights in the lilac segment
-  for (int i = 0; i < 4; i++) { dh_light[i] = 2; }
+  // data rows: number block (dim colour, light text), name block (full colour, dark text), blinking square
+  uint16_t pal[6] = { LC_BLUE, LC_VIOLET, LC_ORANGE, LC_PEACH, LC_BLUE, LC_SALMON };
+  for (int i = 0; i < DR_N; i++) {
+    DrRow& r = dr[i];
+    r.y = (int16_t)(DR_Y0 + i * 20 + (i >= 6 ? 6 : 0) + (i >= 12 ? 6 : 0));
+    r.col = pal[(i * 5 + i / 3) % 6];
+    r.period = (uint16_t)random(700, 3200);
+    r.name = (uint8_t)random(0, 24);
+    uint16_t dim = op_scale(r.col, 105);
+    lcRRect(DR_X, r.y, 52, DR_H, 3, dim, bg);
+    opf_init(r.num, DR_X + 49, r.y + 8 + sm.cap / 2, sm, i % 4 == 3 ? "+###.#" : "######", 0xFFFF, dim, true);
+    dr_name_draw(r);
+    dr_square_draw(r, (i & 1) != 0);
+  }
   uint32_t now = millis();
-  dh_t_roll = dh_t_stat = now;
+  dh_t_roll = dh_t_stat = dh_t_name = now;
   dh_on = true;
 }
 
@@ -673,19 +712,18 @@ void dash_tick(uint32_t now) {
   static uint32_t last = 0;
   if (now - last < 60) return;
   last = now;
-  opf_step(dh_rail[0]); opf_step(dh_rail[1]); opf_step(dh_rail[2]); opf_step(dh_odo);
-  if (now - dh_t_roll > 800) {
+  for (int i = 0; i < DR_N; i++) opf_step(dr[i].num);
+  opf_step(dh_odo);
+  if (now - dh_t_roll > 220) {
     dh_t_roll = now;
-    int r = random(0, 4);
-    if (r < 3) opf_poke(dh_rail[r]); else opf_poke(dh_odo);
+    for (int k = 0; k < 2; k++) opf_poke(dr[random(0, DR_N)].num);
+    if (random(0, 5) == 0) opf_poke(dh_odo);
   }
-  for (int i = 0; i < 4; i++) {
-    uint8_t on = (uint8_t)((now / DH_PERIOD[i]) & 1U);
-    if (on != dh_light[i]) {
-      dh_light[i] = on;
-      gfx->fillRect(80, DH_LIGHT_Y[i], 16, 16, on ? LC_GOLD : LC_LILAC);
-    }
+  for (int i = 0; i < DR_N; i++) {
+    uint8_t on = (uint8_t)((now / dr[i].period) & 1U);
+    if (on != dr[i].sq) dr_square_draw(dr[i], on);
   }
+  if (now - dh_t_name > 2600) { dh_t_name = now; DrRow& r = dr[random(0, DR_N)]; r.name = (uint8_t)random(0, 24); dr_name_draw(r); }
   if (now - dh_t_stat > 9000) { dh_t_stat = now; dh_stat_i++; dh_status(); }
   if (current_hour != dh_clk_h || current_minute != dh_clk_m || dh_clk_ok != clock_initialized) dh_clock();
 }
