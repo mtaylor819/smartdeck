@@ -48,7 +48,8 @@ packaged app) so `System Events` keystrokes and media keys work.
 
 ## Look & sound
 
-- **Colour scheme:** the dropdown in the header (TNG / Voyager / Picard). Remembered per browser.
+- **Colour scheme:** Settings → Colour scheme (TNG / Voyager / Picard) colours the deck's LCARS frame, keys and sleep screens
+  (`SET_SCHEME`, needs the updated firmware) and this page; it is stored in the config. The header dropdown is a per-browser view of the same choice.
 - **Interface sounds:** the *Sound* button toggles synthesized beeps in the web UI (no audio files).
 - **Deck sounds on the Mac:** Settings → Sounds, or in config: `"sounds": {"press": "chirp", "error": "error", "volume": 50}`.
   Built-ins: `chirp`, `confirm`, `error`, `blip` (regenerate with `node scripts/make-sounds.mjs`), or any absolute file path.

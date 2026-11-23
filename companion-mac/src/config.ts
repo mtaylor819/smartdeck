@@ -92,6 +92,8 @@ export interface Config {
   brightnessSchedule?: Array<{ from: string; to: string; brightness: number }>;
   /** Which screen the deck shows while asleep. 'diag' = starship-style system diagnostics (needs the updated firmware). */
   sleepScreen?: 'clock' | 'diag' | 'diag-anim' | 'warp';
+  /** LCARS colour scheme on the deck (and the web UI): TNG (default), Voyager or Picard. Needs the updated firmware. */
+  scheme?: 'tng' | 'voyager' | 'picard';
   /** Mac-side audio feedback. press/error are a built-in name (chirp|confirm|error|blip), an absolute file path, or 'none'. */
   sounds?: { press?: string; error?: string; volume?: number };
 }
@@ -181,6 +183,8 @@ export function validate(c: Config): Config {
   if (!(c.knob.step > 0)) throw new Error('knob.step must be > 0');
   if (c.sleepScreen !== undefined && !['clock', 'diag', 'diag-anim', 'warp'].includes(c.sleepScreen))
     throw new Error("sleepScreen must be 'clock', 'diag', 'diag-anim' or 'warp'");
+  if (c.scheme !== undefined && !['tng', 'voyager', 'picard'].includes(c.scheme))
+    throw new Error("scheme must be 'tng', 'voyager' or 'picard'");
   const d = c.device;
   if (d) {
     if (d.token !== undefined && !/^[\x21-\x7e]{8,64}$/.test(d.token)) throw new Error('device.token must be 8-64 printable characters');

@@ -94,7 +94,7 @@ const TOAST_MS = 2500;
 const HA_UNAVAILABLE_COLOR = '3a3a3a';
 
 /** Commands that do NOT count as user activity (mirror of the patched firmware + features.h modules). */
-const NO_WAKE = ['HB', 'DIAG:', 'SET_BTN_DATA:', 'SET_TIME:', 'WEATHER:', 'SET_DIM_LED:', 'SET_SLEEP_SCREEN:', 'SET_NET:', 'GET_NET', 'SET_BLE:', 'SET_AUTODIM:', 'SET_GESTURES:', 'SET_BTN_LIVE:', 'BLE_HOST:'];
+const NO_WAKE = ['HB', 'DIAG:', 'SET_BTN_DATA:', 'SET_TIME:', 'WEATHER:', 'SET_DIM_LED:', 'SET_SLEEP_SCREEN:', 'SET_SCHEME:', 'SET_NET:', 'GET_NET', 'SET_BLE:', 'SET_AUTODIM:', 'SET_GESTURES:', 'SET_BTN_LIVE:', 'BLE_HOST:'];
 
 const defaultTheme = { bg_color: '000000', btn_color: '333333', text_color: 'ffffff', stroke_color: '555555', shadow_color: '000000' };
 
@@ -542,6 +542,10 @@ export class DeckEmulator extends EventEmitter {
       if (!SLEEP_SCREENS.includes(m)) return;
       s.sleepScreen = m; this.savePrefs();
       return this.out(`SLEEP_SCREEN_SET:${m}`);
+    }
+    if (line.startsWith('SET_SCHEME:')) {
+      const m = arg('SET_SCHEME:').trim();
+      return this.out(['tng', 'voyager', 'picard'].includes(m) ? `SCHEME_SET:${m}` : 'ERR_SCHEME');
     }
     if (line.startsWith('SET_NET:')) return this.setNet(arg('SET_NET:'));
     if (line.startsWith('SET_BLE:')) return this.setBle(arg('SET_BLE:'));

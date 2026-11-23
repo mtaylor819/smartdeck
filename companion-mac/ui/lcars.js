@@ -42,6 +42,16 @@
     } catch { /* audio unavailable: stay silent */ }
   };
 
+  // The Settings page (and a saved config) can set the scheme too; this keeps the header dropdown in step.
+  window.lcarsSetTheme = function (t) {
+    if (!THEMES.includes(t)) return;
+    theme = t;
+    document.documentElement.dataset.theme = t;
+    store.set('sd-theme', t);
+    const s = document.getElementById('themeSel');
+    if (s) s.value = t;
+  };
+
   // ---- controls ----
   const sel = document.getElementById('themeSel');
   if (sel) {

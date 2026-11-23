@@ -200,6 +200,7 @@ export class Daemon implements DaemonApi {
       if (pw?.dimLed) await this.deck.send(cmd.setDimLed(pw.dimLed));
       if (pw?.ledBrightness !== undefined) await this.deck.send(cmd.setLedBrightness(pw.ledBrightness));
       if (c.sleepScreen) await this.deck.send(cmd.setSleepScreen(c.sleepScreen));
+      if (c.scheme) await this.deck.send(cmd.setScheme(c.scheme));
       await this.pushDiag();
       await this.pushWeather();
       this.lastSched = undefined;

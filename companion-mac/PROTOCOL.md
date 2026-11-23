@@ -49,6 +49,10 @@ Text lines, `\n` terminated, same on every link (USB serial 115200, WiFi TCP). B
   page (clamped, no wrap) and emits `PAGE_CHANGED:n`; it must NOT trigger a button. A button whose JSON has `"hold":true` emits
   `BTN_HOLD:page:idx` when held >= holdMs (and then does NOT emit the normal `BTN` on release); buttons without `hold` behave as today.
 
+## Colour scheme
+- `SET_SCHEME:tng|voyager|picard` (reply `SCHEME_SET:<name>`, `ERR_SCHEME` for an unknown name): recolours the LCARS frame, keys and
+  sleep screens (same palettes as `ui/style.css`); stored in Preferences (`lc_scheme`) and redraws the current page. Does not wake the deck.
+
 ## Sleep screens
 - `SET_SLEEP_SCREEN:clock|diag|diag-anim|warp` (reply `SLEEP_SCREEN_SET:<mode>`): clock (default, existing), diag (static
   diagnostics, existing), diag-anim (diagnostics with animated LCARS details), warp (animated warp-streak starfield + large clock).

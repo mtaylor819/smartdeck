@@ -61,6 +61,7 @@ export class Deck extends EventEmitter {
     if (pw?.dimLed) await this.send(cmd.setDimLed(pw.dimLed));
     if (pw?.ledBrightness !== undefined) await this.send(cmd.setLedBrightness(pw.ledBrightness));
     if (this.config.sleepScreen) await this.send(cmd.setSleepScreen(this.config.sleepScreen));
+    if (this.config.scheme) await this.send(cmd.setScheme(this.config.scheme));
     await this.send(cmd.getSync()); // deck replies with SYNC_PAGE / KNOB_RAW / SYNC_STATE...
   }
 

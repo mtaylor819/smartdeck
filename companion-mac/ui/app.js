@@ -596,6 +596,11 @@ function drawSettings() {
     row('Volume %', num(c.sounds, 'volume', { min: 0, max: 100, placeholder: '60' })),
     h('div', { class: 'muted' }, 'Built-in: chirp, confirm, error, blip — or an absolute path to a .wav/.aiff/.mp3 file.'));
 
+  const schemeBox = h('div', {}, h('h3', {}, 'Colour scheme'),
+    row('Scheme', h('select', { onchange: (e) => { c.scheme = e.target.value; if (window.lcarsSetTheme) window.lcarsSetTheme(c.scheme); chg(); } },
+      [['tng', 'TNG'], ['voyager', 'Voyager'], ['picard', 'Picard']].map(([v, l]) => h('option', { value: v, selected: (c.scheme || 'tng') === v }, l)))),
+    h('div', { class: 'muted' }, 'Colours the deck\'s LCARS frame and keys, and this page. Needs the updated firmware.'));
+
   const sleepBox = h('div', {}, h('h3', {}, 'Sleep screen'),
     row('Show', h('select', { onchange: (e) => { if (e.target.value === 'clock') delete c.sleepScreen; else c.sleepScreen = e.target.value; chg(); } },
       [['clock', 'Clock + weather'], ['diag', 'Starship diagnostics'], ['diag-anim', 'Diagnostics (animated)'], ['warp', 'Warp speed + clock']].map(([v, l]) => h('option', { value: v, selected: (c.sleepScreen || 'clock') === v }, l)))),
@@ -694,7 +699,7 @@ function drawSettings() {
       onclick: async () => { try { await api('POST', '/api/alert', { kind: k, seconds: k === 'off' ? 0 : 10, text: k === 'red' ? 'Red alert' : '' }); } catch (e) { toast(e.message, true); } } }, k))));
 
   v.append(h('div', { class: 'inline' }, h('h2', {}, 'Settings'), h('div', { class: 'spacer' }), h('button', { onclick: () => setView('editor') }, '← Back to buttons')),
-    h('div', { class: 'grid2' }, h('div', {}, general, power, sleepBox, schedBox, soundsBox), h('div', {}, knobBox, connBox, deckBox, alertBox, trigBox, wBox, rules, haBox)));
+    h('div', { class: 'grid2' }, h('div', {}, general, schemeBox, power, sleepBox, schedBox, soundsBox), h('div', {}, knobBox, connBox, deckBox, alertBox, trigBox, wBox, rules, haBox)));
 }
 /** Shrinking the grid silently drops buttons that no longer fit: ask first. */
 function confirmShrink(c, cols, rows) {
@@ -761,6 +766,7 @@ async function init() {
   $('logBtn').addEventListener('click', () => { $('logDrawer').hidden = !$('logDrawer').hidden; });
   try {
     state.cfg = await api('GET', '/api/config');
+    if (state.cfg && state.cfg.scheme && window.lcarsSetTheme) window.lcarsSetTheme(state.cfg.scheme);
     await loadIcons();
   } catch (e) { toast('Could not load config: ' + e.message, true); return; }
   // Normalise optional sections so the unmodified config is not "dirty" after the editor adds defaults.

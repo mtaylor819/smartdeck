@@ -145,6 +145,7 @@ export const cmd = {
   setDimLed: (anim: string) => `SET_DIM_LED:${anim}`,
   setLedBrightness: (n: number) => `SET_LED_BRIGHTNESS:${clamp(Math.round(n), 0, 255)}`,
   setSleepScreen: (mode: 'clock' | 'diag' | 'diag-anim' | 'warp') => `SET_SLEEP_SCREEN:${mode}`,
+  setScheme: (scheme: 'tng' | 'voyager' | 'picard') => `SET_SCHEME:${scheme}`,
   diag: (d: { cpu: number; mem: number; disk: number; rx: number; tx: number; uptimeMin: number; host: string }) =>
     `DIAG:${clamp(Math.round(d.cpu), 0, 100)}:${clamp(Math.round(d.mem), 0, 100)}:${clamp(Math.round(d.disk), 0, 100)}:` +
     `${Math.max(0, Math.round(d.rx))}:${Math.max(0, Math.round(d.tx))}:${Math.max(0, Math.round(d.uptimeMin))}:` +
