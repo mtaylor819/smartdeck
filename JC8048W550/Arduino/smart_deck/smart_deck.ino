@@ -5,6 +5,7 @@
 
 #include "config.h"
 #include "live_table.h"  // [live] RAM-only per-button display overrides (consulted by draw_single_button)
+#include "lcars_font.h"  // generated anti-aliased LCARS text fonts (firmware/tools/genfont.py)
 #include "toggle_table.h"  // [toggle] toggle states survive draw_page() rebuilds (alert clear, BT toast/indicator removal, swipe clamp, wake)
 
 // Receiver MAC for ESP-NOW dongle mode
@@ -241,10 +242,13 @@ typedef struct {
 } JpegDrawInfo;
 
 JpegDrawInfo jpegInfo;
+uint16_t jpeg_bg_color = 0;  // colour behind the key, for blending the icon's rounded edge
 
 
 // --- FUNCTION PROTOTYPES (Prevents compiler errors) ---
 void draw_page(int page_index);
+void dash_init(const char* page_name, int page_index, int page_count);  // anim.h: live LCARS rail/foot elements of the key page
+void dash_tick(uint32_t now);
 void draw_single_button(int btn_index);
 void checkActiveTimers();
 
@@ -696,14 +700,24 @@ uint8_t sin8(uint8_t theta) {
 // the regions whose values changed (no fillScreen => no flicker).
 // ============================================================================
 #define C565(r, g, b) ((uint16_t)((((r) & 0xF8) << 8) | (((g) & 0xFC) << 3) | ((b) >> 3)))
-#define LC_ORANGE C565(0xFF, 0x99, 0x00)
-#define LC_PEACH  C565(0xFF, 0x99, 0x66)
-#define LC_TAN    C565(0xFF, 0xCC, 0x99)
-#define LC_LILAC  C565(0xCC, 0x99, 0xCC)
-#define LC_VIOLET C565(0x99, 0x99, 0xCC)
-#define LC_BLUE   C565(0x99, 0xCC, 0xFF)
-#define LC_SALMON C565(0xCC, 0x66, 0x66)
-#define LC_GOLD   C565(0xFF, 0xCC, 0x66)
+// Colour schemes (same palettes as the Mac web UI: companion-mac/ui/style.css). Selected with SET_SCHEME, stored in Preferences.
+struct LcPalette { uint16_t orange, peach, tan, lilac, violet, blue, salmon, gold, chip; };
+static const LcPalette LC_PALETTES[3] = {
+  /* tng     */ { C565(0xFF, 0x99, 0x00), C565(0xFF, 0x99, 0x66), C565(0xFF, 0xCC, 0x99), C565(0xCC, 0x99, 0xCC), C565(0x99, 0x99, 0xCC), C565(0x99, 0xCC, 0xFF), C565(0xCC, 0x66, 0x66), C565(0xFF, 0xCC, 0x66), C565(0x17, 0x14, 0x1F) },
+  /* voyager */ { C565(0x8D, 0xA0, 0xE8), C565(0xD9, 0x8A, 0xA8), C565(0xF0, 0xC9, 0xA0), C565(0xB6, 0x9B, 0xE0), C565(0x6F, 0x86, 0xC8), C565(0x9F, 0xD0, 0xF5), C565(0xD9, 0x66, 0x7A), C565(0xFF, 0xB3, 0x47), C565(0x11, 0x15, 0x2B) },
+  /* picard  */ { C565(0x46, 0xC8, 0xE8), C565(0xE8, 0x74, 0x3B), C565(0xBF, 0xE3, 0xEE), C565(0x7A, 0xA3, 0xD8), C565(0x3F, 0x7F, 0xB5), C565(0x8F, 0xE0, 0xF0), C565(0xE0, 0x52, 0x3F), C565(0xF2, 0xB1, 0x34), C565(0x0B, 0x1A, 0x26) },
+};
+static uint8_t lc_scheme = 0;
+static const LcPalette* lcp = &LC_PALETTES[0];
+#define LC_ORANGE (lcp->orange)
+#define LC_PEACH  (lcp->peach)
+#define LC_TAN    (lcp->tan)
+#define LC_LILAC  (lcp->lilac)
+#define LC_VIOLET (lcp->violet)
+#define LC_BLUE   (lcp->blue)
+#define LC_SALMON (lcp->salmon)
+#define LC_GOLD   (lcp->gold)
+#define LC_CHIP   (lcp->chip)
 #define LC_RED    C565(0xFF, 0x40, 0x40)
 
 #define DIAG_STALE_MS 120000UL
@@ -1008,11 +1022,81 @@ void drawWeatherIcon(int x, int y, const uint16_t* icon) {
 
 // ---- LCARS key shape: small radius on the left, fully rounded right end ----
 #define LCARS_LEFT_R 8
-static const uint16_t LCARS_KEY_COLORS[8] = { LC_ORANGE, LC_LILAC, LC_VIOLET, LC_BLUE, LC_PEACH, LC_SALMON, LC_TAN, LC_GOLD };
+static uint16_t lcKeyPal(int i) {
+  const LcPalette* q = lcp;
+  const uint16_t c[8] = { q->orange, q->lilac, q->violet, q->blue, q->peach, q->salmon, q->tan, q->gold };
+  return c[i & 7];
+}
+// ---- Anti-aliased shapes: fill a rectangle, then carve rounded corners with per-pixel coverage blended onto `bg` ----
+static uint16_t lcBlend(uint16_t fg, uint16_t bg, uint8_t a) {  // a = 0..15
+  if (a >= 15) return fg;
+  uint32_t fr = (fg >> 11) & 31, fgc = (fg >> 5) & 63, fb = fg & 31;
+  uint32_t br = (bg >> 11) & 31, bgc = (bg >> 5) & 63, bb = bg & 31;
+  uint32_t r = (fr * a + br * (15 - a)) / 15, g = (fgc * a + bgc * (15 - a)) / 15, b = (fb * a + bb * (15 - a)) / 15;
+  return (uint16_t)((r << 11) | (g << 5) | b);
+}
+// Corner of radius r whose circle centre is at the inner corner; (ox,oy) is the pixel next to the centre, (sx,sy) points outward.
+static void lcCarve(int ox, int oy, int sx, int sy, int r, uint16_t col, uint16_t bg) {
+  float rf = (float)r;
+  for (int j = 0; j < r; j++) {
+    float dy = j + 0.5f;
+    float of = (rf + 0.5f) * (rf + 0.5f) - dy * dy;
+    float ff = (rf - 0.5f) * (rf - 0.5f) - dy * dy;
+    int iOut = of > 0 ? (int)ceilf(sqrtf(of) - 0.5f) : 0;
+    int iFull = ff > 0 ? (int)floorf(sqrtf(ff) - 0.5f) + 1 : 0;
+    if (iOut > r) iOut = r;
+    if (iFull > iOut) iFull = iOut;
+    for (int i = iFull; i < iOut; i++) {
+      float d = sqrtf((i + 0.5f) * (i + 0.5f) + dy * dy);
+      float cv = rf + 0.5f - d;
+      int a = cv <= 0 ? 0 : (cv >= 1 ? 15 : (int)(cv * 15.0f + 0.5f));
+      gfx->drawPixel(ox + sx * i, oy + sy * j, a >= 15 ? col : (a <= 0 ? bg : lcBlend(col, bg, (uint8_t)a)));
+    }
+    if (iOut < r) {  // fully outside the circle: background
+      int n = r - iOut;
+      int x0 = sx > 0 ? ox + iOut : ox - iOut - n + 1;
+      gfx->fillRect(x0, oy + sy * j, n, 1, bg);
+    }
+  }
+}
+// Rectangle with an individual radius on each corner (0 = square).
+static void lcShape(int x, int y, int w, int h, int rTL, int rTR, int rBR, int rBL, uint16_t col, uint16_t bg) {
+  int m = (w < h ? w : h) / 2;
+  if (rTL > m) rTL = m; if (rTR > m) rTR = m; if (rBR > m) rBR = m; if (rBL > m) rBL = m;
+  gfx->fillRect(x, y, w, h, col);
+  if (rTL) lcCarve(x + rTL - 1, y + rTL - 1, -1, -1, rTL, col, bg);
+  if (rTR) lcCarve(x + w - rTR, y + rTR - 1, 1, -1, rTR, col, bg);
+  if (rBR) lcCarve(x + w - rBR, y + h - rBR, 1, 1, rBR, col, bg);
+  if (rBL) lcCarve(x + rBL - 1, y + h - rBL, -1, 1, rBL, col, bg);
+}
+static void lcRRect(int x, int y, int w, int h, int r, uint16_t col, uint16_t bg) { lcShape(x, y, w, h, r, r, r, r, col, bg); }
+// Pill: both ends rounded (rl/rr choose which ends).
+static void lcPill(int x, int y, int w, int h, uint16_t col, uint16_t bg, bool rl = true, bool rr = true) {
+  int r = h / 2;
+  lcShape(x, y, w, h, rl ? r : 0, rr ? r : 0, rr ? r : 0, rl ? r : 0, col, bg);
+}
+// Concave fillet: the square [x, x+S) x [y, y+S) in `col` minus the circle of radius S-1 centred on its bottom-right corner (x+S, y+S).
+static void lcFillet(int x, int y, int S, uint16_t col, uint16_t bg) {
+  float R = (float)(S - 1);
+  float cx = (float)(x + S), cy = (float)(y + S);
+  for (int py = y; py < y + S; py++) {
+    float dy = cy - (py + 0.5f);
+    float o = (R + 0.5f) * (R + 0.5f) - dy * dy, in = (R - 0.5f) * (R - 0.5f) - dy * dy;
+    float xa = cx - (o > 0 ? sqrtf(o) : 0.0f), xb = cx - (in > 0 ? sqrtf(in) : 0.0f);
+    int full = (int)floorf(xa - 0.5f);  // pixels with px+0.5 <= xa are fully outside the circle
+    if (full >= x) gfx->fillRect(x, py, full - x + 1 > S ? S : full - x + 1, 1, col);
+    for (int px = (full + 1 > x ? full + 1 : x); px < x + S && px + 0.5f <= xb; px++) {
+      float d = sqrtf((px + 0.5f - cx) * (px + 0.5f - cx) + dy * dy);
+      float cv = d - R + 0.5f;
+      int a = cv <= 0 ? 0 : (cv >= 1 ? 15 : (int)(cv * 15.0f + 0.5f));
+      if (a > 0) gfx->drawPixel(px, py, a >= 15 ? col : lcBlend(col, bg, (uint8_t)a));
+    }
+  }
+}
+
 void lcarsFill(int x, int y, int w, int h, uint16_t c) {
   int R = (w < h ? w : h) / 2;
-  gfx->fillRoundRect(x, y, w, h, R, c);                         // fully rounded pill/circle
-  gfx->fillRoundRect(x, y, w / 2 + 1, h, LCARS_LEFT_R, c);      // left half back to a tight radius
+  lcShape(x, y, w, h, LCARS_LEFT_R, R, R, LCARS_LEFT_R, c, theme_bg_color_rgb565);   // tight left corners, fully rounded right end
 }
 // Quarter-circle outline centred (cx,cy), pointing in direction (sx,sy) = (+/-1,+/-1).
 void lcarsArc(int cx, int cy, int r, int sx, int sy, uint16_t c) {
@@ -1038,7 +1122,7 @@ void lcarsOutline(int x, int y, int w, int h, uint16_t c) { lcarsOutline1(x, y, 
 // Un-pressed key edge: no visible stroke (the LCARS fill is the shape), so repaint nothing / restore with the fill colour.
 // Default-coloured keys cycle the LCARS palette so the grid reads as LCARS buttons.
 uint16_t lcarsKeyColor(int idx, uint16_t themeColor, bool isDefault) {
-  if (isDefault && (themeColor == C565(0x1A, 0x1A, 0x2E) || themeColor == C565(0x33, 0x33, 0x33))) return LCARS_KEY_COLORS[idx & 7];
+  if (isDefault && (themeColor == C565(0x1A, 0x1A, 0x2E) || themeColor == C565(0x33, 0x33, 0x33))) return lcKeyPal(idx);
   return themeColor;
 }
 // True when a button uses the (palette-cycled) default colour, so its text should be black like LCARS keys.
@@ -1049,6 +1133,116 @@ bool lcarsDefaultKey(JsonObject cfg, int idx) {
 }
 // Pressed-key highlight sits just outside the key (there is a gap between keys); erase by drawing it in the background colour.
 void lcarsPress(int x, int y, int w, int h, uint16_t c) { lcarsOutline(x - 3, y - 3, w + 6, h + 6, c); }
+
+// ---- Anti-aliased text (Barlow Condensed, generated lcars_font.h: 4-bit coverage blended onto a known background) ----
+// Largest font not above `px` (or the smallest font).
+static const LcFont& lcFontPx(int px) {
+  const LcFont* best = &LC_FONTS[0];
+  for (int i = 0; i < LC_NFONTS; i++) if (LC_FONTS[i].px <= px) best = &LC_FONTS[i];
+  return *best;
+}
+static int lcW(const LcFont& f, const char* t) {
+  int w = 0;
+  for (const uint8_t* q = (const uint8_t*)t; *q; q++) if (*q >= 0x20 && *q <= 0x7E) w += f.g[*q - 0x20].adv;
+  return w;
+}
+// Draw text with its baseline at `base`. `hard` = no blending (use over images): pixels are fully on or off.
+static void lcDraw(const LcFont& f, int x, int base, const char* t, uint16_t fg, uint16_t bg, bool hard = false) {
+  for (const uint8_t* q = (const uint8_t*)t; *q; q++) {
+    if (*q < 0x20 || *q > 0x7E) continue;
+    const LcGlyph& g = f.g[*q - 0x20];
+    for (int r = 0; r < g.h; r++) {
+      for (int c = 0; c < g.w; c++) {
+        uint32_t i = (uint32_t)r * g.w + c;
+        uint8_t byte = f.bm[g.off + i / 2];
+        uint8_t a = (i & 1) ? (byte & 15) : (byte >> 4);
+        if (!a) continue;
+        if (hard) { if (a >= 7) gfx->drawPixel(x + g.xo + c, base + g.yo + r, fg); }
+        else gfx->drawPixel(x + g.xo + c, base + g.yo + r, lcBlend(fg, bg, a));
+      }
+    }
+    x += g.adv;
+  }
+}
+// Text with its cap-height centred on cy; x is the left edge, or the right edge when `right`.
+static void lcPrintC(const LcFont& f, int x, int cy, const char* t, uint16_t fg, uint16_t bg, bool right = false) {
+  lcDraw(f, right ? x - lcW(f, t) : x, cy + f.cap / 2, t, fg, bg);
+}
+// Text centred in a key cell (or sitting on its bottom edge).
+static void lcCenter(int x, int y, int w, int h, const char* t, const LcFont& f, uint16_t fg, uint16_t bg, bool bottom = false) {
+  int base = bottom ? y + h - 10 : y + h / 2 + f.cap / 2;
+  lcDraw(f, x + (w - lcW(f, t)) / 2, base, t, fg, bg, bottom);
+}
+// labelSize (px from the config) -> font: keeps the old three tiers (<=14, <=22, larger).
+static int lcLabelPx(int labelSize) { return labelSize <= 14 ? 14 : (labelSize <= 22 ? 22 : 32); }
+
+static void lcUpper(char* dst, size_t n, const char* src, size_t maxChars) {
+  size_t i = 0;
+  for (; src && src[i] && i < n - 1 && i < maxChars; i++) dst[i] = (char)toupper((unsigned char)src[i]);
+  dst[i] = 0;
+}
+
+// ---- LCARS page frame, mirroring the virtual deck (companion-mac/ui-virtual/style.css) ----
+// Top: orange elbow (concave inner curve) -> stub -> brand pill -> tan line -> dark chips. Left: gapped colour rail.
+// Bottom: violet elbow + foot bar. The key grid lives in x >= FRAME_RAIL_W, y 50..440 (see draw_page).
+#define FRAME_RAIL_W 124   // rail (110) + gap; keys are laid out in screenWidth - FRAME_RAIL_W
+#define FRAME_FOOT_Y 446   // foot bar top (34 px tall, to the bottom edge)
+
+void lcarsFrame(const char* title, const char* page_name, int page_index, int page_count) {
+  int W = (int)screenWidth;
+  int edge = W - 6;  // right margin, like the virtual deck's frame padding
+  const LcFont& big = lcFontPx(32);
+  const LcFont& small = lcFontPx(19);
+
+  uint16_t bg = theme_bg_color_rgb565;
+  // --- Elbow: 110 x 84, top-left radius 70, plus the concave fillet under the top arm ---
+  lcShape(0, 0, 110, 84, 70, 0, 0, 0, LC_ORANGE, bg);
+  lcFillet(109, 40, 34, LC_ORANGE, bg);
+
+  // --- Top arm: stub, brand pill, tan line, chips ---
+  gfx->fillRect(116, 0, 34, 40, LC_ORANGE);  // stub
+  char brand[40];
+  lcUpper(brand, sizeof(brand), title, 24);
+  const LcFont* bf = &big;
+  if (lcW(big, brand) + 36 > 400) bf = &small;
+  int bw = lcW(*bf, brand) + 36;
+  lcShape(146, 0, bw, 40, 0, 20, 20, 0, LC_ORANGE, bg);
+  lcPrintC(*bf, 146 + 18, 20, brand, BLACK, LC_ORANGE);
+
+  // Chips, right to left: page number, then page name
+  char pg[16];
+  snprintf(pg, sizeof(pg), "PAGE %d/%d", page_index + 1, page_count);
+  char pn[20];
+  lcUpper(pn, sizeof(pn), page_name, 14);
+  int c1w = lcW(small, pg) + 32, c2w = lcW(small, pn) + 32;
+  int x1 = edge - c1w;
+  lcRRect(x1, 0, c1w, 40, 20, LC_CHIP, bg);
+  lcPrintC(small, x1 + 16, 20, pg, LC_BLUE, LC_CHIP);
+  int x2 = x1 - 6 - c2w;
+  if (pn[0] && x2 > 146 + bw + 6 + 20) {
+    lcRRect(x2, 0, c2w, 40, 20, LC_CHIP, bg);
+    lcPrintC(small, x2 + 16, 20, pn, LC_TAN, LC_CHIP);
+  } else {
+    x2 = x1;
+  }
+  // Tan line filling the gap between brand and chips
+  int lx = 146 + bw + 10, lw = x2 - 10 - lx;
+  if (lw > 10) lcRRect(lx, 14, lw, 12, 6, LC_TAN, bg);
+
+  // --- Rail: gapped segments with right-aligned numbers ---
+  char num[8];
+  gfx->fillRect(0, 90, 110, 44, LC_PEACH);
+  snprintf(num, sizeof(num), "%02d", page_index + 1);
+  lcPrintC(small, 110 - 12, 90 + 44 - 6 - small.cap / 2, num, BLACK, LC_PEACH, true);
+  gfx->fillRect(0, 140, 110, 90, LC_VIOLET);
+  gfx->fillRect(0, 236, 110, 44, LC_BLUE);
+  gfx->fillRect(0, 286, 110, 154, LC_LILAC);
+
+  // --- Foot: violet elbow (rounded bottom-left, radius 34) + bar (rounded right end) ---
+  lcShape(0, FRAME_FOOT_Y, 110, 34, 0, 0, 0, 34, LC_VIOLET, bg);
+  lcShape(116, FRAME_FOOT_Y, edge - 116, 34, 0, 17, 17, 0, LC_VIOLET, bg);
+  dash_init(page_name, page_index, page_count);  // rail numbers/lights, foot text, status, clock (animated in dash_tick)
+}
 
 // *** TJpgDec Output Callback Function *** (Remains the same)
 bool tft_output(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t* bitmap) {
@@ -1069,7 +1263,7 @@ bool tft_output(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t* bitmap) 
         continue;
       }
 
-      bool draw_pixel = true;
+      int cov15 = 15;  // 0..15 coverage of the LCARS key shape (rounded corners are anti-aliased)
       {  // LCARS key shape: small radius r on the left, fully rounded (min(w,h)/2) right end
         int rr_ = (btn_w < btn_h ? btn_w : btn_h) / 2;
         int cx = -1, cy = -1, rad = 0;
@@ -1079,15 +1273,21 @@ bool tft_output(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t* bitmap) 
         else if (btn_rel_x >= btn_w - rr_ && btn_rel_y >= btn_h - rr_) { cx = btn_w - 1 - rr_; cy = btn_h - 1 - rr_; rad = rr_; }
         if (rad > 0) {
           long dx = (long)btn_rel_x - cx, dy = (long)btn_rel_y - cy;
-          if (dx * dx + dy * dy > (long)rad * rad) draw_pixel = false;
+          long d2 = dx * dx + dy * dy;
+          if (d2 > (long)(rad + 1) * (rad + 1)) cov15 = 0;
+          else if (d2 > (long)rad * rad) {
+            float cv = (float)rad + 0.5f - sqrtf((float)d2);
+            cov15 = cv <= 0 ? 0 : (int)(cv * 15.0f + 0.5f);
+          }
         }
       }
 
-      if (draw_pixel) {
+      if (cov15 > 0) {
         int16_t draw_x = jpegInfo.x + btn_rel_x;
         int16_t draw_y = jpegInfo.y + btn_rel_y;
 
         uint16_t color = bitmap[py * w + px];
+        if (cov15 < 15) color = lcBlend(color, jpeg_bg_color, (uint8_t)cov15);
         gfx->drawPixel(draw_x, draw_y, color);
       }
     }
@@ -1470,21 +1670,10 @@ void checkActiveTimers() {
 
         // Draw "00:00" text
         // ... (Metin çizim kodları aynı) ...
-        int label_size_px = button_cfg["labelSize"] | 18;
-        int final_font_size = mapFontSize(label_size_px);
-        if (final_font_size < 3) final_font_size = 3;
-
-        gfx->setTextSize(final_font_size);
         uint16_t text_color_to_use = lcarsDefaultKey(button_cfg, i) ? (uint16_t)0x0000 : theme_text_color_rgb565;
         const char* label_color_hex = button_cfg["labelColor"];
         if (label_color_hex) text_color_to_use = hex_to_rgb565(label_color_hex);
-        gfx->setTextColor(text_color_to_use);
-
-        int16_t tx, ty;
-        uint16_t tw, th;
-        gfx->getTextBounds("00:00", 0, 0, &tx, &ty, &tw, &th);
-        gfx->setCursor(button.x + (button.w - tw) / 2, button.y + (button.h - th) / 2);
-        gfx->print("00:00");
+        lcCenter(button.x, button.y, button.w, button.h, "00:00", lcFontPx(40), text_color_to_use, 0xF800);
 
       }
       // B. Time not expired, did second change?
@@ -1507,21 +1696,10 @@ void checkActiveTimers() {
 
         lcarsFill(button.x, button.y, button.w, button.h, btn_color_rgb565);
 
-        int label_size_px = button_cfg["labelSize"] | 18;
-        int final_font_size = mapFontSize(label_size_px);
-        if (final_font_size < 3) final_font_size = 3;
-
-        gfx->setTextSize(final_font_size);
         uint16_t text_color_to_use = theme_text_color_rgb565;
         const char* label_color_hex = button_cfg["labelColor"];
         if (label_color_hex) text_color_to_use = hex_to_rgb565(label_color_hex);
-        gfx->setTextColor(text_color_to_use);
-
-        int16_t tx, ty;
-        uint16_t tw, th;
-        gfx->getTextBounds(time_str, 0, 0, &tx, &ty, &tw, &th);
-        gfx->setCursor(button.x + (button.w - tw) / 2, button.y + (button.h - th) / 2);
-        gfx->print(time_str);
+        lcCenter(button.x, button.y, button.w, button.h, time_str, lcFontPx(40), text_color_to_use, btn_color_rgb565);
       }
     }
 
@@ -1553,21 +1731,10 @@ void checkActiveTimers() {
 
       lcarsFill(button.x, button.y, button.w, button.h, flash_color);
 
-      int label_size_px = button_cfg["labelSize"] | 18;
-      int final_font_size = mapFontSize(label_size_px);
-      if (final_font_size < 3) final_font_size = 3;
-
-      gfx->setTextSize(final_font_size);
       uint16_t text_color_to_use = theme_text_color_rgb565;
       const char* label_color_hex = button_cfg["labelColor"];
       if (label_color_hex) text_color_to_use = hex_to_rgb565(label_color_hex);
-      gfx->setTextColor(text_color_to_use);
-
-      int16_t tx, ty;
-      uint16_t tw, th;
-      gfx->getTextBounds("00:00", 0, 0, &tx, &ty, &tw, &th);
-      gfx->setCursor(button.x + (button.w - tw) / 2, button.y + (button.h - th) / 2);
-      gfx->print("00:00");
+      lcCenter(button.x, button.y, button.w, button.h, "00:00", lcFontPx(40), text_color_to_use, flash_color);
     }
   }
 }
@@ -1606,15 +1773,16 @@ void draw_single_button(int btn_index) {
 
   int gapX = 0;
   if (COLS > 1) {
-    gapX = (screenWidth - (COLS * CELL_W)) / (COLS + 1);
+    gapX = ((int)screenWidth - FRAME_RAIL_W - (COLS * CELL_W)) / (COLS + 1);
   } else {
-    gapX = (screenWidth - CELL_W) / 2;
+    gapX = ((int)screenWidth - FRAME_RAIL_W - CELL_W) / 2;
   }
 
   int shadow_offset_x = 5;
-  int totalPaddingSpaceX = screenWidth - (COLS * CELL_W) - ((COLS - 1) * gapX);
+  int totalPaddingSpaceX = (int)screenWidth - FRAME_RAIL_W - (COLS * CELL_W) - ((COLS - 1) * gapX);
   int padX_left = (totalPaddingSpaceX - shadow_offset_x) / 2;
   if (padX_left < 0) padX_left = 0;
+  padX_left += FRAME_RAIL_W;  // keys sit to the right of the LCARS rail
 
   int r = btn_index / COLS;
   int c = btn_index % COLS;
@@ -1697,6 +1865,7 @@ void draw_single_button(int btn_index) {
           jpegInfo.x_offset = (CELL_W - jpg_w) / 2;
           jpegInfo.y_offset = (CELL_H - jpg_h) / 2;
           jpegInfo.radius = LCARS_LEFT_R;
+          jpeg_bg_color = bg_color;
           TJpgDec.drawSdJpg(0, 0, fileToDraw.c_str());
         } else {
           Serial.printf("ERR: JPG size 0 for %s\n", fileToDraw.c_str());
@@ -1754,51 +1923,31 @@ void draw_single_button(int btn_index) {
   }
   if (live_ov && (live_ov->flags & LIVE_F_SIZE)) label_size_px = live_ov->labelSize;  // [live]
 
-  // [live] Fit a (possibly long) normal-button label into the cell: shrink the font, then trim characters.
+  // Pick the label font from labelSize (timers/counters use the big one), then shrink until it fits the cell;
+  // normal-button labels may also be trimmed (stock firmware never drew these; see [live] notes above).
   char live_fit[LIVE_LABEL_MAX + 1];
   bool live_is_text_btn = (btn_info.action != "timer" && btn_info.action != "counter");
-  int live_fit_size = 0;
+  const LcFont* label_font = &lcFontPx(live_is_text_btn ? lcLabelPx(label_size_px) : 40);
   if (label_text && live_is_text_btn) {
     strncpy(live_fit, label_text, LIVE_LABEL_MAX);
     live_fit[LIVE_LABEL_MAX] = '\0';
     label_text = live_fit;
-    int16_t fx, fy;
-    uint16_t fw, fh;
-    live_fit_size = mapFontSize(label_size_px);
+  }
+  if (label_text) {
     for (;;) {
-      gfx->setTextSize(live_fit_size);
-      gfx->getTextBounds(live_fit, 0, 0, &fx, &fy, &fw, &fh);
-      if (fw <= (uint16_t)(CELL_W - 10)) break;
-      if (live_fit_size > 1) live_fit_size--;
-      else if (strlen(live_fit) > 1) live_fit[strlen(live_fit) - 1] = '\0';
+      if (lcW(*label_font, label_text) <= CELL_W - 12) break;
+      if (label_font > &LC_FONTS[0]) label_font--;
+      else if (live_is_text_btn && strlen(live_fit) > 1) live_fit[strlen(live_fit) - 1] = '\0';
       else break;
     }
   }
 
   if (label_text) {
-    int final_font_size = mapFontSize(label_size_px);
-    if ((btn_info.action == "timer" || btn_info.action == "counter")) {
-      final_font_size = 3;
-    } else if (live_fit_size > 0) {
-      final_font_size = live_fit_size;  // [live] size chosen by the fit loop above
-    }
-
-    gfx->setTextSize(final_font_size);
     uint16_t text_color_to_use = lcars_dflt ? (uint16_t)0x0000 : theme_text_color_rgb565;
     const char* label_color_hex = button_cfg["labelColor"];
     if (label_color_hex) text_color_to_use = hex_to_rgb565(label_color_hex);
     if (live_ov && (live_ov->flags & LIVE_F_LCOLOR)) text_color_to_use = live_ov->lcolor;  // [live]
-
-    gfx->setTextColor(text_color_to_use);
-
-    int16_t tx, ty;
-    uint16_t tw, th;
-    gfx->getTextBounds(label_text, 0, 0, &tx, &ty, &tw, &th);
-    int text_x = x_pos + (CELL_W - tw) / 2;
-    int text_y = y_pos + (CELL_H - th) / 2;
-    if (label_bottom) text_y = y_pos + CELL_H - th - 8;  // [showLabel]
-    gfx->setCursor(text_x, text_y);
-    gfx->print(label_text);
+    lcCenter(x_pos, y_pos, CELL_W, CELL_H, label_text, *label_font, text_color_to_use, bg_color, label_bottom);
   }
 }
 
@@ -1856,28 +2005,21 @@ void draw_page(int page_index) {
   padY_top += start_y_offset;
 
   int gapX = 0;
-  if (COLS > 1) gapX = (screenWidth - (COLS * CELL_W)) / (COLS + 1);
-  else gapX = (screenWidth - CELL_W) / 2;
+  if (COLS > 1) gapX = ((int)screenWidth - FRAME_RAIL_W - (COLS * CELL_W)) / (COLS + 1);
+  else gapX = ((int)screenWidth - FRAME_RAIL_W - CELL_W) / 2;
 
   int shadow_offset_x = 5;
-  int totalPaddingSpaceX = screenWidth - (COLS * CELL_W) - ((COLS - 1) * gapX);
+  int totalPaddingSpaceX = (int)screenWidth - FRAME_RAIL_W - (COLS * CELL_W) - ((COLS - 1) * gapX);
   int padX_left = (totalPaddingSpaceX - shadow_offset_x) / 2;
   if (padX_left < 0) padX_left = 0;
+  padX_left += FRAME_RAIL_W;  // keys sit to the right of the LCARS rail
 
   // ---------------------------------------------------------
 
-  // Device Title (Center Header)
+  // LCARS frame: title in the top bar, page name + number in the foot bar
   const char* title_text = doc["title"] | "Stream Deck";
-  gfx->setTextSize(2);
-  gfx->setTextColor(theme_text_color_rgb565);
-  int16_t tx, ty;
-  uint16_t tw, th;
-  gfx->getTextBounds(title_text, 0, 0, &tx, &ty, &tw, &th);
-
-  // Center title vertically (within 50px header area)
-  int header_center_y = (50 / 2) - 15;
-  gfx->setCursor((screenWidth - tw) / 2, header_center_y + (th / 2));
-  gfx->print(title_text);
+  const char* frame_page_name = pages_array[page_index]["name"] | "Page";
+  lcarsFrame(title_text, frame_page_name, page_index, (int)pages_array.size());
 
   // NOTE: The line between (drawFastHLine) was removed from here.
 
@@ -2037,7 +2179,7 @@ void draw_page(int page_index) {
     // If empty page, show "Go to Page 1" button in center
     if (!has_any_filled_button) {
       int btn_size = 70;  // Square button
-      int btn_x = (screenWidth - btn_size) / 2;
+      int btn_x = FRAME_RAIL_W + ((int)screenWidth - FRAME_RAIL_W - btn_size) / 2;
       int btn_y = (screenHeight - btn_size) / 2;
 
       // Draw button background (accent blue color)
@@ -2069,16 +2211,7 @@ void draw_page(int page_index) {
     }
   }
 
-  // Page Name (Bottom Bar - Footer)
-  const char* page_name_text = pages_array[page_index]["name"] | "Page";
-  int footer_y = screenHeight - 30;
-
-  gfx->setTextSize(2);
-  gfx->setTextColor(theme_text_color_rgb565);
-  gfx->getTextBounds(page_name_text, 0, 0, &tx, &ty, &tw, &th);
-  gfx->setCursor((screenWidth - tw) / 2, footer_y);
-  gfx->print(page_name_text);
-
+  // (Page name is drawn in the LCARS foot bar by lcarsFrame())
   gfx->setTextSize(2);
 }
 
@@ -2139,6 +2272,9 @@ void setup() {
   current_brightness = preferences.getInt("bright", 100);
   sleep_enabled = preferences.getBool("sleep_on", true);
   sleep_screen_diag = preferences.getBool("sleep_diag", false);
+  lc_scheme = preferences.getUChar("lc_scheme", 0);
+  if (lc_scheme > 2) lc_scheme = 0;
+  lcp = &LC_PALETTES[lc_scheme];
   int sleep_min = preferences.getInt("sleep_min", 5);
   sleep_timeout_ms = (unsigned long)sleep_min * 60 * 1000;
 
@@ -2640,6 +2776,24 @@ void loop() {
         }
       }
 
+      // --- LCARS colour scheme. Format: SET_SCHEME:tng|voyager|picard ---
+      else if (command.startsWith("SET_SCHEME:")) {
+        String name = command.substring(11);
+        name.trim();
+        int m = (name == "tng") ? 0 : (name == "voyager") ? 1 : (name == "picard") ? 2 : -1;
+        if (m < 0) {
+          Serial.println("ERR_SCHEME");
+        } else {
+          bool changed = (m != lc_scheme);
+          lc_scheme = (uint8_t)m;
+          lcp = &LC_PALETTES[m];
+          preferences.putUChar("lc_scheme", (uint8_t)m);
+          Serial.printf("SCHEME_SET:%s\n", name.c_str());
+          if (changed && !is_sleeping && !is_deep_sleeping) draw_page(current_page);
+          else if (changed && is_sleeping && !is_deep_sleeping) { diag_frame_drawn = false; draw_sleep_clock(); }
+        }
+      }
+
       // --- Diagnostics sleep screen: choose screen. Format: SET_SLEEP_SCREEN:clock|diag ---
       else if (command.startsWith("SET_SLEEP_SCREEN:")) {
         String mode = command.substring(17);
@@ -2720,7 +2874,7 @@ void loop() {
           }
         }
         update_activity();
-      } else if (!command.startsWith("SET_TIME:") && !command.startsWith("SET_BTN_DATA:") && !command.startsWith("SET_BRIGHTNESS:")) {
+      } else if (!command.startsWith("SET_TIME:") && !command.startsWith("SET_BTN_DATA:") && !command.startsWith("SET_BRIGHTNESS:") && !command.startsWith("SET_SCHEME:")) {
         // SET_BRIGHTNESS decides for itself whether it counts as activity (it must not wake a sleeping deck, see above).
         // SET_BTN_DATA is a background host update (live widgets): it must not wake a sleeping deck.
         update_activity();

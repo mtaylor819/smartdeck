@@ -19,7 +19,9 @@ CORE_URL="https://espressif.github.io/arduino-esp32/package_esp32_index.json"
 
 # Board options (NOT specified upstream; chosen for the JC8048W550 = ESP32-S3 N16R8, see README.md)
 FQBN="esp32:esp32:esp32s3"
-OPTIONS="FlashSize=16M,PartitionScheme=app3M_fat9M_16MB,PSRAM=opi,FlashMode=${SMARTDECK_FW_FLASH_MODE:-dio},CDCOnBoot=default"
+# Verified on hardware: compile QIO (stable RGB panel) but patch the image header to DIO/40 MHz (QIO/80 MHz boot-loops this board).
+# Compiling the app in DIO mode made the panel flicker. Flash with: --flash_mode dio --flash_freq 40m (see README).
+OPTIONS="FlashSize=16M,PartitionScheme=app3M_fat9M_16MB,PSRAM=opi,FlashMode=${SMARTDECK_FW_FLASH_MODE:-qio},CDCOnBoot=default"
 
 export ARDUINO_DIRECTORIES_DATA="$WORK/arduino/data"
 export ARDUINO_DIRECTORIES_USER="$WORK/arduino/user"
