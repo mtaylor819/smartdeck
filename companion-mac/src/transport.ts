@@ -50,8 +50,10 @@ export async function listCandidatePorts(): Promise<string[]> {
   const looksLikeEsp = (p: (typeof ports)[number]) =>
     /cu\.(usbmodem|usbserial|wchusbserial|SLAB_USBtoUART)|ttyACM|ttyUSB/.test(p.path) ||
     ['303a', '10c4', '1a86', '0403'].includes((p.vendorId ?? '').toLowerCase());
-  // On macOS prefer /dev/cu.* (call-out) over /dev/tty.* (waits for carrier detect).
-  return ports.filter(looksLikeEsp).map((p) => p.path).filter((p) => !p.includes('/tty.'));
+  // On macOS prefer /dev/cu.* (call-out) over /dev/tty.* (waits for carrier detect). Some macOS/serialport
+  // combinations list only the tty.* node, so map it to its cu.* twin instead of discarding it.
+  const paths = ports.filter(looksLikeEsp).map((p) => p.path.replace('/dev/tty.', '/dev/cu.'));
+  return [...new Set(paths)];
 }
 
 /** Open each candidate, send PING_DECK, and return the first one that answers PONG_DECK. */

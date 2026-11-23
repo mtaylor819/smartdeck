@@ -19,7 +19,7 @@ CORE_URL="https://espressif.github.io/arduino-esp32/package_esp32_index.json"
 
 # Board options (NOT specified upstream; chosen for the JC8048W550 = ESP32-S3 N16R8, see README.md)
 FQBN="esp32:esp32:esp32s3"
-OPTIONS="FlashSize=16M,PartitionScheme=app3M_fat9M_16MB,PSRAM=opi,FlashMode=dio,CDCOnBoot=default"
+OPTIONS="FlashSize=16M,PartitionScheme=app3M_fat9M_16MB,PSRAM=opi,FlashMode=${SMARTDECK_FW_FLASH_MODE:-dio},CDCOnBoot=default"
 
 export ARDUINO_DIRECTORIES_DATA="$WORK/arduino/data"
 export ARDUINO_DIRECTORIES_USER="$WORK/arduino/user"
@@ -39,7 +39,7 @@ export PATH="$WORK/venv/bin:$PATH"
 # Several builds can share one toolchain dir; serialise the compile step if flock exists.
 LOCK=()
 command -v flock >/dev/null 2>&1 && LOCK=(flock "$WORK/.compile.lock")
-"${LOCK[@]}" "$CLI" compile --fqbn "$FQBN" --board-options "$OPTIONS" \
+${LOCK[@]+"${LOCK[@]}"} "$CLI" compile --fqbn "$FQBN" --board-options "$OPTIONS" \
   --libraries "$LIBS" \
   --build-path "$BUILD" --output-dir "$DIST/parts" "$SKETCH"
 
@@ -49,7 +49,7 @@ cp "$BOOT_APP0" "$P/boot_app0.bin"
 
 # ESP32-S3 flash layout: bootloader 0x0, partition table 0x8000, boot_app0 0xe000, app 0x10000
 esptool.py --chip esp32s3 merge_bin -o "$DIST/smartdeck-jc8048w550-merged.bin" \
-  --flash_mode dio --flash_freq 40m --flash_size 16MB \
+  --flash_mode "${SMARTDECK_FW_HDR_MODE:-dio}" --flash_freq "${SMARTDECK_FW_HDR_FREQ:-40m}" --flash_size 16MB \
   0x0 "$P/smart_deck.ino.bootloader.bin" \
   0x8000 "$P/smart_deck.ino.partitions.bin" \
   0xe000 "$P/boot_app0.bin" \
