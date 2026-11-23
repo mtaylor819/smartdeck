@@ -16,7 +16,7 @@ Size: app ≈ 527 KB of the 3 MB app partition; merged image ≈ 580 KB.
 
 ## Board options and where they came from
 
-FQBN `esp32:esp32:esp32s3` with `FlashSize=16M,PartitionScheme=app3M_fat9M_16MB,PSRAM=opi,FlashMode=qio,CDCOnBoot=default`.
+FQBN `esp32:esp32:esp32s3` with `FlashSize=16M,PartitionScheme=app3M_fat9M_16MB,PSRAM=opi,FlashMode=dio,CDCOnBoot=default`.
 
 | Option | Value | Provenance |
 |---|---|---|
@@ -25,7 +25,7 @@ FQBN `esp32:esp32:esp32s3` with `FlashSize=16M,PartitionScheme=app3M_fat9M_16MB,
 | Flash size 16 MB | 16M | **Assumed**: the usual spec for this board (ESP32-S3-WROOM-1 N16R8). Not stated in the repo. |
 | PSRAM | OPI (8 MB) | **Assumed**: same module; the 800x480 RGB framebuffer needs PSRAM. Wrong value = black screen/boot loop. |
 | Partition scheme | 16M (3 MB app / 9.9 MB FATFS) | **Assumed**; any 16 MB scheme with an app ≥ 1 MB works since the sketch is only ~527 KB. |
-| Flash mode / freq | QIO / 80 MHz | **Assumed** (Arduino defaults for the S3 Dev Module). If the board won't boot, rebuild with `DIO`. |
+| Flash mode / freq | DIO / 40 MHz | **Verified on hardware**: QIO / 80 MHz boot-looped (watchdog reset in the bootloader); DIO / 40 MHz boots. |
 | USB CDC on boot | disabled | **Assumed**: the sketch uses `Serial` at 115200 and the board has a USB-UART bridge. If your unit enumerates as `usbmodem` via native USB, the host app would need CDC on boot enabled instead. |
 
 **Nothing here has been tested on real hardware.** The original Windows app flashes its own bundled binary, whose
